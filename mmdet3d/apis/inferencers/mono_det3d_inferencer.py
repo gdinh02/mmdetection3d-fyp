@@ -122,7 +122,9 @@ class MonoDet3DInferencer(Base3DInferencer):
                         data_info['images'][cam_type]['lidar2img'],
                         dtype=np.float32)
                 else:
-                    lidar2img = cam2img @ lidar2cam
+                    # lidar2img = cam2img @ lidar2cam
+                    lidar2img = cam2img @ lidar2cam[0:3]
+                                        
                 input['cam2img'] = cam2img
                 input['lidar2cam'] = lidar2cam
                 input['lidar2img'] = lidar2img
