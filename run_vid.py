@@ -14,7 +14,7 @@ from collections import deque
 import numpy as np
 
 MODEL_FILE = "configs/fcos3d/fcos3d_r101-caffe-dcn_fpn_head-gn_8xb2-1x_nus-mono3d_finetune.py"
-WEIGHTS_FILE = "fcos3d_r101_caffe_fpn_gn-head_dcn_2x8_1x_nus-mono3d_finetune_20210717_095645-8d806dc2.pth"
+WEIGHTS_FILE = "checkpoints/fcos3d_r101_caffe_fpn_gn-head_dcn_2x8_1x_nus-mono3d_finetune_20210717_095645-8d806dc2.pth"
 DEVICE = "cuda:0"
 
 DATASET_ROOT = "./data/nuscenes"
