@@ -35,7 +35,7 @@ class MonoDet3DInferencerTimer(MonoDet3DInferencer):
         print(f"Forward Time: {(stop - start) * 1000:.2f} ms")
         return result
 
-def filter_predictions(predictions, threshold):
+def filter_predictions(predictions, threshold, allowed_classes):
     """Filters 3D object detection predictions based on a score threshold.
 
     Args:
@@ -63,7 +63,7 @@ def filter_predictions(predictions, threshold):
         filtered_items = [
             (box, score, label)
             for box, score, label in zip(boxes, scores, labels)
-            if score >= threshold
+            if score >= threshold and label in allowed_classes
         ]
 
         # Unpack filtered results back into lists (handles empty cases gracefully)
@@ -142,7 +142,7 @@ def main():
                 pred_score_thr=PRED_SCORE_THR
             )
 
-        filtered_preds = filter_predictions(result['predictions'], PRED_SCORE_THR)
+        filtered_preds = filter_predictions(result['predictions'], PRED_SCORE_THR, [0, 1, 2, 3, 4, 8 ,9])
 
         curr_binary_map = generate_binary_bev_map(
             filtered_preds[0]['bboxes_3d'], 

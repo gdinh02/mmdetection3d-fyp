@@ -146,9 +146,7 @@ def update_visualization(fig, ax_img, ax_bev, image_path, bboxes_3d, scores_3d, 
     ax_img.clear()
     ax_bev.clear()
     
-    # ==========================================
     # 1. Plot the Raw Camera Image
-    # ==========================================
     try:
         img = mpimg.imread(image_path)
         ax_img.imshow(img)
@@ -158,22 +156,18 @@ def update_visualization(fig, ax_img, ax_bev, image_path, bboxes_3d, scores_3d, 
         ax_img.text(0.5, 0.5, 'Image not found.', ha='center', va='center')
         ax_img.axis('off')
 
-    # ==========================================
     # 2. Render the Blended Binary Map
-    # ==========================================
     if blended_map is not None:
         ax_bev.imshow(
             blended_map, 
-            extent=[-20, 20, 0, 50], # Ensure this matches your grid limits!
+            extent=[-20, 20, 0, 50], 
             origin='lower', 
-            cmap='gray',             # Grayscale works best for binary maps
-            alpha=0.6,               # Slight transparency
+            cmap='gray',             
+            alpha=0.6,               
             zorder=1
         )
 
-    # ==========================================
     # 3. Plot the BEV Bounding Boxes & Arrows
-    # ==========================================
 
     # 1. Pre-filter the lists to ensure exact index alignment with DBSCAN outputs
     valid_objects = [(box, score, label) for box, score, label in zip(bboxes_3d, scores_3d, labels_3d) if score >= score_thresh]
