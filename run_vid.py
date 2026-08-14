@@ -66,6 +66,7 @@ def filter_predictions(predictions, threshold):
             if score >= threshold
         ]
 
+
         # Unpack filtered results back into lists (handles empty cases gracefully)
         if filtered_items:
             f_boxes, f_scores, f_labels = zip(*filtered_items)
