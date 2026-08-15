@@ -20,7 +20,19 @@ from .anchor_free_mono3d_head import AnchorFreeMono3DHead
 RangeType = Sequence[Tuple[int, int]]
 
 INF = 1e8
-
+KEEP_CLASS_IDS = [0]
+# Only retain vehicle classes useful for lane inference.
+# nuScenes:
+# 0 car
+# 1 truck
+# 2 trailer
+# 3 bus
+# 4 construction_vehicle
+# 5 bicycle
+# 6 motorcycle
+# 7 pedestrian
+# 8 traffic_cone
+# 9 barrier
 
 @MODELS.register_module()
 class FCOSMono3DHead(AnchorFreeMono3DHead):
@@ -632,6 +644,15 @@ class FCOSMono3DHead(AnchorFreeMono3DHead):
             assert cls_score.size()[-2:] == bbox_pred.size()[-2:]
             scores = cls_score.permute(1, 2, 0).reshape(
                 -1, self.cls_out_channels).sigmoid()
+            # Added class masking
+            class_mask = torch.zeros(
+                self.num_classes,
+                dtype=torch.bool,
+                device=scores.device
+            )
+            class_mask[KEEP_CLASS_IDS] = True
+            scores[:, ~class_mask] = 0.0
+
             dir_cls_pred = dir_cls_pred.permute(1, 2, 0).reshape(-1, 2)
             dir_cls_score = torch.max(dir_cls_pred, dim=-1)[1]
             attr_pred = attr_pred.permute(1, 2, 0).reshape(-1, self.num_attrs)
@@ -697,6 +718,25 @@ class FCOSMono3DHead(AnchorFreeMono3DHead):
                                        cfg.max_per_img, cfg, mlvl_dir_scores,
                                        mlvl_attr_scores)
         bboxes, scores, labels, dir_scores, attrs = results
+
+        # Final safety filter: cars only
+        keep = torch.isin(
+            labels,
+            torch.tensor(
+                KEEP_CLASS_IDS,
+                device=labels.device,
+                dtype=labels.dtype
+            )
+        )
+
+        bboxes = bboxes[keep]
+        scores = scores[keep]
+        labels = labels[keep]
+        dir_scores = dir_scores[keep]
+
+        if attrs is not None:
+            attrs = attrs[keep]
+
         attrs = attrs.to(labels.dtype)  # change data type to int
         bboxes = img_meta['box_type_3d'](
             bboxes, box_dim=self.bbox_code_size, origin=(0.5, 0.5, 0.5))
@@ -711,7 +751,10 @@ class FCOSMono3DHead(AnchorFreeMono3DHead):
         results.labels_3d = labels
         if self.pred_attrs and attrs is not None:
             results.attr_labels = attrs
-
+        print(
+            "FCOS3D RETURN:",
+            results.labels_3d.detach().cpu().tolist()
+        )
         return results
 
     def _get_points_single(self,

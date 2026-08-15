@@ -23,7 +23,7 @@ IMAGE_DIR = f"{DATASET_ROOT}/samples"
 OUT_DIR = 'outputs/samples_inference'
 TEMP_INFO_FILE = 'temp_single_sample_info.pkl' # Temporary file to trick the inferencer
 
-PRED_SCORE_THR = 0.2
+PRED_SCORE_THR = 0.25
 
 class MonoDet3DInferencerTimer(MonoDet3DInferencer):
     def forward(self, inputs, **kwargs):
@@ -184,6 +184,7 @@ def main():
             ax_img,
             ax_bev,
             os.path.join(OUT_DIR, "vis_camera", "CAM2", img_rel_path),
+            # img_full_path,
             filtered_preds[0]['bboxes_3d'],
             filtered_preds[0]['scores_3d'],
             filtered_preds[0]['labels_3d'],
