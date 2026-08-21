@@ -6,7 +6,7 @@ import sqlite3
 import pandas as pd
 import streamlit as st
 
-# run with: streamlit run scene_reviewer_sqlite.py --server.fileWatcherType none
+# run with: streamlit run nuscenes_tools/scene_reviewer_sqlite.py --server.fileWatcherType none
 
 # ============================================================
 # CONFIG
