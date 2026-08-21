@@ -106,10 +106,10 @@ def align_multi_frame_history(curr_map, history_buffer, weights):
                 flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP
             )
 
-            print(warp_matrix[:, 2])
+            # print(warp_matrix[:, 2])
         except cv2.error:
             # Fallback if ECC fails (e.g., zero overlap)
-            print("Align failed")
+            # print("Align failed")
             aligned_prev = prev_map 
             
         # Add the weighted historical frame to the final map
@@ -153,7 +153,7 @@ def update_visualization(fig, ax_img, ax_bev, image_path, bboxes_3d, scores_3d, 
         ax_img.set_title("Front Camera Image")
         ax_img.axis('off')
     except FileNotFoundError:
-        ax_img.text(0.5, 0.5, 'Image not found.', ha='center', va='center')
+        ax_img.text(0.5, 0.5, f'Image not found: {image_path}', ha='center', va='center')
         ax_img.axis('off')
 
     # 2. Render the Blended Binary Map

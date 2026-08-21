@@ -1,13 +1,8 @@
 import os
-import mmengine
 from mmengine.fileio import load, dump
-from mmdet3d.apis import MonoDet3DInferencer
-
-import torch
-import time
-import json
 
 from bevconvert import update_visualization, setup_visualization, generate_binary_bev_map, align_multi_frame_history, smooth_binary_map
+from custom_inferencer import MonoDet3DInferencerWithFilter
 import matplotlib.pyplot as plt
 import cv2
 from collections import deque
@@ -25,15 +20,6 @@ TEMP_INFO_FILE = 'temp_single_sample_info.pkl' # Temporary file to trick the inf
 
 PRED_SCORE_THR = 0.25
 
-class MonoDet3DInferencerTimer(MonoDet3DInferencer):
-    def forward(self, inputs, **kwargs):
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        result = super().forward(inputs, **kwargs)
-        torch.cuda.synchronize()
-        stop = time.perf_counter()
-        print(f"Forward Time: {(stop - start) * 1000:.2f} ms")
-        return result
 
 def filter_predictions(predictions, threshold, allowed_classes):
     """Filters 3D object detection predictions based on a score threshold.
@@ -85,11 +71,9 @@ def filter_predictions(predictions, threshold, allowed_classes):
 
     return filtered_predictions
 
-
-
 def main():
     print("Initializing Inferencer...")
-    inferencer = MonoDet3DInferencer(model=MODEL_FILE, weights=WEIGHTS_FILE, device=DEVICE)
+    inferencer = MonoDet3DInferencerWithFilter(model=MODEL_FILE, weights=WEIGHTS_FILE, device=DEVICE)
     inferencer.forward
 
     print("Loading massive NuScenes info file...")
@@ -108,13 +92,6 @@ def main():
     alpha = 0.5
 
     for sample_idx, sample in enumerate(nuscenes_info['data_list']):
-        
-        single_sample_dict = {
-            'metainfo': metainfo,
-            'data_list': [sample] # Length is exactly 1!
-        }
-        
-        dump(single_sample_dict, TEMP_INFO_FILE)
 
         for cam_type, cam_info in sample['images'].items():
             if cam_type != "CAM_FRONT":
@@ -128,7 +105,7 @@ def main():
             # 3. Pass the single image and the single-sample temporary pkl
             inputs = dict(
                 img=img_full_path,
-                infos=TEMP_INFO_FILE 
+                infos=INFO_FILE
             )
 
             # Because both inputs and the temp pkl have a length of 1, 
@@ -136,18 +113,22 @@ def main():
             result = inferencer(
                 inputs=inputs,
                 cam_type=cam_type,
+                cam_type_dir=cam_type,
                 out_dir=OUT_DIR,
                 # show=True,
                 print_result=False,
                 wait_time=0.01,
-                pred_score_thr=PRED_SCORE_THR
+                pred_score_thr=PRED_SCORE_THR,
+                class_filter=[0]
             )
 
-        filtered_preds = filter_predictions(result['predictions'], PRED_SCORE_THR, [0, 1, 2, 3, 4, 8 ,9])
+            break # Stop at chosen camera
+
+        # filtered_preds = filter_predictions(result['predictions'], PRED_SCORE_THR, [0, 1, 2, 3, 4, 8 ,9])
 
         curr_binary_map = generate_binary_bev_map(
-            filtered_preds[0]['bboxes_3d'], 
-            filtered_preds[0]['scores_3d'], 
+            result['predictions'][0]['bboxes_3d'], 
+            result['predictions'][0]['scores_3d'], 
             score_thresh=0.2
         )
 
@@ -183,11 +164,11 @@ def main():
             fig,
             ax_img,
             ax_bev,
-            os.path.join(OUT_DIR, "vis_camera", "CAM2", img_rel_path),
+            os.path.join(OUT_DIR, "vis_camera", cam_type, img_rel_path),
             # img_full_path,
-            filtered_preds[0]['bboxes_3d'],
-            filtered_preds[0]['scores_3d'],
-            filtered_preds[0]['labels_3d'],
+            result['predictions'][0]['bboxes_3d'],
+            result['predictions'][0]['scores_3d'],
+            result['predictions'][0]['labels_3d'],
             blended_map=final_map,      # FIX: Pass the map directly into the visualizer
             score_thresh=PRED_SCORE_THR,
             timeout=0.1
