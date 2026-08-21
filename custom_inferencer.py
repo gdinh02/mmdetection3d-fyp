@@ -6,6 +6,8 @@ import os.path as osp
 
 from mmdet3d.apis import MonoDet3DInferencer
 from mmdet3d.apis.inferencers.mono_det3d_inferencer import InputsType, PredType
+from mmengine.fileio import get_file_backend, isdir, join_path, list_dir_or_file
+                 
 
 from typing import List, Union
 
@@ -120,3 +122,95 @@ class MonoDet3DInferencerWithFilter(MonoDet3DInferencer):
             self.num_visualized_imgs += 1
 
         return results
+
+    # Handle image list and single pkl file
+    def _inputs_to_list(self,
+                        inputs: Union[dict, list],
+                        cam_type='CAM2',
+                        **kwargs) -> list:
+        """Preprocess the inputs to a list."""
+        if isinstance(inputs, dict):
+            assert 'infos' in inputs
+            infos = inputs.pop('infos')
+
+            if isinstance(inputs['img'], str):
+                img = inputs['img']
+                backend = get_file_backend(img)
+                if hasattr(backend, 'isdir') and isdir(img):
+                    filename_list = list_dir_or_file(img, list_dir=False)
+                    inputs = [{
+                        'img': join_path(img, filename)
+                    } for filename in filename_list]
+
+            if not isinstance(inputs, (list, tuple)):
+                inputs = [inputs]
+
+            # Load the pkl once
+            info_list = mmengine.load(infos)['data_list']
+            
+            # --- FIX: Create an O(1) lookup dictionary matching filenames to their data ---
+            info_dict = {
+                osp.basename(info['images'][cam_type]['img_path']): info 
+                for info in info_list
+            }
+
+            for input in inputs:
+                img_name = osp.basename(input['img'])
+                if img_name not in info_dict:
+                    raise ValueError(f'The info file for {img_name} is not provided in the .pkl.')
+                
+                data_info = info_dict[img_name]
+                
+                cam2img = np.asarray(
+                    data_info['images'][cam_type]['cam2img'], dtype=np.float32)
+                lidar2cam = np.asarray(
+                    data_info['images'][cam_type]['lidar2cam'],
+                    dtype=np.float32)
+                if 'lidar2img' in data_info['images'][cam_type]:
+                    lidar2img = np.asarray(
+                        data_info['images'][cam_type]['lidar2img'],
+                        dtype=np.float32)
+                else:
+                    lidar2img = cam2img @ lidar2cam[0:3]
+                                        
+                input['cam2img'] = cam2img
+                input['lidar2cam'] = lidar2cam
+                input['lidar2img'] = lidar2img
+
+        elif isinstance(inputs, (list, tuple)):
+            for input in inputs:
+                assert 'infos' in input
+                infos = input.pop('infos')
+                
+                info_list = mmengine.load(infos)['data_list']
+                
+                # --- FIX: Create an O(1) lookup dictionary for the list branch as well ---
+                info_dict = {
+                    osp.basename(info['images'][cam_type]['img_path']): info 
+                    for info in info_list
+                }
+                
+                img_name = osp.basename(input['img'])
+                if img_name not in info_dict:
+                    raise ValueError(f'The info file for {img_name} is not provided in the .pkl.')
+                
+                data_info = info_dict[img_name]
+                
+                cam2img = np.asarray(
+                    data_info['images'][cam_type]['cam2img'], dtype=np.float32)
+                lidar2cam = np.asarray(
+                    data_info['images'][cam_type]['lidar2cam'],
+                    dtype=np.float32)
+                if 'lidar2img' in data_info['images'][cam_type]:
+                    lidar2img = np.asarray(
+                        data_info['images'][cam_type]['lidar2img'],
+                        dtype=np.float32)
+                else:
+                    lidar2img = cam2img @ lidar2cam
+                    
+                input['cam2img'] = cam2img
+                input['lidar2cam'] = lidar2cam
+                input['lidar2img'] = lidar2img
+
+        return list(inputs)
+                

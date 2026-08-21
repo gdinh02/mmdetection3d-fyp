@@ -92,13 +92,6 @@ def main():
     alpha = 0.5
 
     for sample_idx, sample in enumerate(nuscenes_info['data_list']):
-        
-        single_sample_dict = {
-            'metainfo': metainfo,
-            'data_list': [sample] # Length is exactly 1!
-        }
-        
-        dump(single_sample_dict, TEMP_INFO_FILE)
 
         for cam_type, cam_info in sample['images'].items():
             if cam_type != "CAM_FRONT":
@@ -112,7 +105,7 @@ def main():
             # 3. Pass the single image and the single-sample temporary pkl
             inputs = dict(
                 img=img_full_path,
-                infos=TEMP_INFO_FILE 
+                infos=INFO_FILE
             )
 
             # Because both inputs and the temp pkl have a length of 1, 
