@@ -1,13 +1,8 @@
 import os
-import mmengine
 from mmengine.fileio import load, dump
-from mmdet3d.apis import MonoDet3DInferencer
-
-import torch
-import time
-import json
 
 from bevconvert import update_visualization, setup_visualization, generate_binary_bev_map, align_multi_frame_history, smooth_binary_map
+from custom_inferencer import MonoDet3DInferencerWithFilter
 import matplotlib.pyplot as plt
 import cv2
 from collections import deque
@@ -25,33 +20,6 @@ TEMP_INFO_FILE = 'temp_single_sample_info.pkl' # Temporary file to trick the inf
 
 PRED_SCORE_THR = 0.25
 
-class MonoDet3DInferencerWithFilter(MonoDet3DInferencer):
-    # Add class_filter arg to natively filter classes 
-    forward_kwargs = MonoDet3DInferencer.forward_kwargs | {'class_filter'}
-
-    # Override for class filtering
-    def forward(self, inputs, class_filter = None, **kwargs):
-        preds = super().forward(inputs, **kwargs)
-
-        # print(preds)
-
-        if class_filter:
-            for pred in preds:
-                if 'pred_instances_3d' in pred:
-                    labels = pred.pred_instances_3d.labels_3d
-                    mask = torch.isin(
-                        labels, 
-                        torch.tensor(class_filter, device=labels.device)
-                    )
-                    pred.pred_instances_3d = pred.pred_instances_3d[mask]
-
-        # print(preds)
-
-        return preds
-
-    # Override to fix no image saved with no pred
-    def visualize(self, inputs, preds, return_vis = False, show = False, wait_time = 0, draw_pred = True, pred_score_thr = 0.3, no_save_vis = False, img_out_dir = '', cam_type_dir = 'CAM2'):
-        return super().visualize(inputs, preds, return_vis, show, wait_time, draw_pred, pred_score_thr, no_save_vis, img_out_dir, cam_type_dir)
 
 def filter_predictions(predictions, threshold, allowed_classes):
     """Filters 3D object detection predictions based on a score threshold.
