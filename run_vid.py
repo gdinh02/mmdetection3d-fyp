@@ -25,15 +25,33 @@ TEMP_INFO_FILE = 'temp_single_sample_info.pkl' # Temporary file to trick the inf
 
 PRED_SCORE_THR = 0.25
 
-class MonoDet3DInferencerTimer(MonoDet3DInferencer):
-    def forward(self, inputs, **kwargs):
-        torch.cuda.synchronize()
-        start = time.perf_counter()
-        result = super().forward(inputs, **kwargs)
-        torch.cuda.synchronize()
-        stop = time.perf_counter()
-        print(f"Forward Time: {(stop - start) * 1000:.2f} ms")
-        return result
+class MonoDet3DInferencerWithFilter(MonoDet3DInferencer):
+    # Add class_filter arg to natively filter classes 
+    forward_kwargs = MonoDet3DInferencer.forward_kwargs | {'class_filter'}
+
+    # Override for class filtering
+    def forward(self, inputs, class_filter = None, **kwargs):
+        preds = super().forward(inputs, **kwargs)
+
+        # print(preds)
+
+        if class_filter:
+            for pred in preds:
+                if 'pred_instances_3d' in pred:
+                    labels = pred.pred_instances_3d.labels_3d
+                    mask = torch.isin(
+                        labels, 
+                        torch.tensor(class_filter, device=labels.device)
+                    )
+                    pred.pred_instances_3d = pred.pred_instances_3d[mask]
+
+        # print(preds)
+
+        return preds
+
+    # Override to fix no image saved with no pred
+    def visualize(self, inputs, preds, return_vis = False, show = False, wait_time = 0, draw_pred = True, pred_score_thr = 0.3, no_save_vis = False, img_out_dir = '', cam_type_dir = 'CAM2'):
+        return super().visualize(inputs, preds, return_vis, show, wait_time, draw_pred, pred_score_thr, no_save_vis, img_out_dir, cam_type_dir)
 
 def filter_predictions(predictions, threshold, allowed_classes):
     """Filters 3D object detection predictions based on a score threshold.
@@ -85,11 +103,9 @@ def filter_predictions(predictions, threshold, allowed_classes):
 
     return filtered_predictions
 
-
-
 def main():
     print("Initializing Inferencer...")
-    inferencer = MonoDet3DInferencer(model=MODEL_FILE, weights=WEIGHTS_FILE, device=DEVICE)
+    inferencer = MonoDet3DInferencerWithFilter(model=MODEL_FILE, weights=WEIGHTS_FILE, device=DEVICE)
     inferencer.forward
 
     print("Loading massive NuScenes info file...")
@@ -136,18 +152,22 @@ def main():
             result = inferencer(
                 inputs=inputs,
                 cam_type=cam_type,
+                cam_type_dir=cam_type,
                 out_dir=OUT_DIR,
                 # show=True,
                 print_result=False,
                 wait_time=0.01,
-                pred_score_thr=PRED_SCORE_THR
+                pred_score_thr=PRED_SCORE_THR,
+                class_filter=[0]
             )
 
-        filtered_preds = filter_predictions(result['predictions'], PRED_SCORE_THR, [0, 1, 2, 3, 4, 8 ,9])
+            break # Stop at chosen camera
+
+        # filtered_preds = filter_predictions(result['predictions'], PRED_SCORE_THR, [0, 1, 2, 3, 4, 8 ,9])
 
         curr_binary_map = generate_binary_bev_map(
-            filtered_preds[0]['bboxes_3d'], 
-            filtered_preds[0]['scores_3d'], 
+            result['predictions'][0]['bboxes_3d'], 
+            result['predictions'][0]['scores_3d'], 
             score_thresh=0.2
         )
 
@@ -183,11 +203,11 @@ def main():
             fig,
             ax_img,
             ax_bev,
-            os.path.join(OUT_DIR, "vis_camera", "CAM2", img_rel_path),
+            os.path.join(OUT_DIR, "vis_camera", cam_type, img_rel_path),
             # img_full_path,
-            filtered_preds[0]['bboxes_3d'],
-            filtered_preds[0]['scores_3d'],
-            filtered_preds[0]['labels_3d'],
+            result['predictions'][0]['bboxes_3d'],
+            result['predictions'][0]['scores_3d'],
+            result['predictions'][0]['labels_3d'],
             blended_map=final_map,      # FIX: Pass the map directly into the visualizer
             score_thresh=PRED_SCORE_THR,
             timeout=0.1
