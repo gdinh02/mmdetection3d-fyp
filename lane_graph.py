@@ -801,8 +801,8 @@ def plot_lane_graph(
         yaw = vehicle["yaw"]
 
 
-        length = vehicle["width"]
-        width = vehicle["length"]
+        width = vehicle["width"]
+        length = vehicle["length"]
 
         corners = _vehicle_rectangle(
             x=x,
@@ -999,8 +999,8 @@ def build_lane_compatibility_graph(
         x = float(bev[original_idx, 0])
         z = float(bev[original_idx, 1])
 
-        bev_width = float(bev[original_idx, 2])
-        bev_length = float(bev[original_idx, 3])
+        bev_width = float(bev[original_idx, 3])
+        bev_length = float(bev[original_idx, 2])
 
         yaw = float(bev[original_idx, 4])
 
