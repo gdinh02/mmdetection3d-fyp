@@ -696,6 +696,7 @@ def plot_lane_graph(
     x_range=(-15, 15),
     show_labels=True,
     save_path=None,
+    show=True
 ):
     """
     Plot FCOS3D vehicle detections and the lane compatibility graph.
@@ -921,7 +922,10 @@ def plot_lane_graph(
             f"Saved BEV visualisation to {save_path}"
         )
 
-    plt.show()
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
 
 def build_lane_compatibility_graph(
     pred_instances_3d,

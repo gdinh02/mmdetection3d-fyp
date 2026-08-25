@@ -140,3 +140,6 @@ mmdet3d/evaluation/functional/waymo_utils/compute_segmentation_metrics_main
 # Output Dirs
 outputs
 *.db
+
+# Workspace Files
+mmdetection3d.code-workspace
