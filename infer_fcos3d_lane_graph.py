@@ -1,11 +1,13 @@
 from mmdet3d.apis import inference_mono_3d_detector, init_model
 
 from lane_graph import (
+    LaneBoundaryConfig,
     LaneFitConfig,
     LaneGraphConfig,
     build_lane_compatibility_graph,
     fit_lane_streams,
     get_lane_streams,
+    infer_lane_boundaries,
     plot_lane_graph,
     print_graph_edges,
 )
@@ -30,7 +32,6 @@ INFO_FILE = (
 )
 DEVICE = "cuda:0"
 CAM_TYPE = "CAM_FRONT"
-
 WANTED_VEHICLE_CLASSES = {"car", "truck", "bus"}
 
 GRAPH_CONFIG = LaneGraphConfig(
@@ -48,6 +49,13 @@ FIT_CONFIG = LaneFitConfig(
     residual_threshold=0.75,
     max_trials=200,
     random_seed=0,
+)
+
+BOUNDARY_CONFIG = LaneBoundaryConfig(
+    min_overlap=10.0,
+    min_lane_width=2.5,
+    max_lane_width=5.0,
+    sample_count=50,
 )
 
 
@@ -106,35 +114,23 @@ def main():
     print_graph_edges(graph)
 
     streams = get_lane_streams(graph, min_vehicles=2)
-
-    print("\n========================================")
-    print("CANDIDATE LANE STREAMS")
-    print("========================================")
-
     if not streams:
-        print("No multi-vehicle streams found.")
+        print("\nNo multi-vehicle streams found.")
+        plot_lane_graph(
+            graph,
+            streams=streams,
+            max_depth=50.0,
+            x_range=(-12.0, 12.0),
+            save_path="lane_graph_bev.png",
+        )
         return
 
     lane_fits = fit_lane_streams(graph, streams, cfg=FIT_CONFIG)
-
-    for stream_idx, stream in enumerate(streams):
-        stream = sorted(stream, key=lambda node: graph.nodes[node]["z"])
-        print(f"\nLane stream {stream_idx}:")
-
-        for node in stream:
-            vehicle = graph.nodes[node]
-            print(
-                f"  node={node:2d} "
-                f"x={vehicle['x']:7.2f} "
-                f"z={vehicle['z']:7.2f} "
-                f"yaw={vehicle['yaw']:7.3f} "
-                f"score={vehicle['score']:.3f}"
-            )
+    lane_boundaries = infer_lane_boundaries(lane_fits, cfg=BOUNDARY_CONFIG)
 
     print("\n========================================")
     print("ROBUST LANE FITS")
     print("========================================")
-
     for fit in lane_fits:
         coeff_text = ", ".join(f"{value:.5f}" for value in fit["coefficients"])
         print(
@@ -146,10 +142,30 @@ def main():
             f"outliers={fit['outliers']}"
         )
 
+    print("\n========================================")
+    print("INFERRED LANE BOUNDARIES")
+    print("========================================")
+    if not lane_boundaries:
+        print("No adjacent fitted streams passed the boundary checks.")
+    else:
+        for boundary_id, boundary in enumerate(lane_boundaries):
+            coeff_text = ", ".join(
+                f"{value:.5f}" for value in boundary["coefficients"]
+            )
+            print(
+                f"Boundary {boundary_id}: "
+                f"S{boundary['left_stream_id']} | S{boundary['right_stream_id']} | "
+                f"width={boundary['lane_width']:.2f} m "
+                f"(std={boundary['lane_width_std']:.2f}) | "
+                f"overlap={boundary['overlap']:.1f} m | "
+                f"coefficients=[{coeff_text}]"
+            )
+
     plot_lane_graph(
         graph,
         streams=streams,
         lane_fits=lane_fits,
+        lane_boundaries=lane_boundaries,
         max_depth=50.0,
         x_range=(-12.0, 12.0),
         save_path="lane_graph_bev.png",

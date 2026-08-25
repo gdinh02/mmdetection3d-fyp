@@ -13,11 +13,9 @@ class LaneGraphConfig:
 
     score_thresh: float = 0.25
     max_depth: float = 60.0
-
     max_cross_track: float = 1.6
     max_yaw_diff_deg: float = 15.0
     max_along_track: float = 30.0
-
     sigma_cross_track: float = 0.8
     sigma_yaw_deg: float = 8.0
 
@@ -30,6 +28,16 @@ class LaneFitConfig:
     residual_threshold: float = 0.75
     max_trials: int = 200
     random_seed: int = 0
+
+
+@dataclass
+class LaneBoundaryConfig:
+    """Settings for inferring lane boundaries between fitted lane streams."""
+
+    min_overlap: float = 10.0
+    min_lane_width: float = 2.5
+    max_lane_width: float = 5.0
+    sample_count: int = 50
 
 
 def axial_angle_diff(a, b):
@@ -71,11 +79,7 @@ def pair_metrics(p_i, yaw_i, p_j, yaw_j):
     }
 
 
-def build_lane_compatibility_graph(
-    pred_instances_3d,
-    vehicle_label_ids,
-    cfg=None,
-):
+def build_lane_compatibility_graph(pred_instances_3d, vehicle_label_ids, cfg=None):
     """Build a graph whose edges connect vehicle detections compatible with the same lane."""
     if cfg is None:
         cfg = LaneGraphConfig()
@@ -168,7 +172,7 @@ def get_lane_streams(graph, min_vehicles=2):
 
 
 def print_graph_edges(graph):
-    """Print the geometric compatibility metrics for each retained graph edge."""
+    """Print geometric compatibility metrics for each retained graph edge."""
     for i, j, data in graph.edges(data=True):
         print(
             f"{i:2d} <-> {j:2d} | "
@@ -179,7 +183,7 @@ def print_graph_edges(graph):
         )
 
 
-def _evaluate_polynomial(coefficients, z):
+def evaluate_lane_polynomial(coefficients, z):
     """Evaluate x(z) for coefficients stored as [a0, a1, a2, ...]."""
     z = np.asarray(z, dtype=np.float64)
     x = np.zeros_like(z, dtype=np.float64)
@@ -190,12 +194,23 @@ def _evaluate_polynomial(coefficients, z):
     return x
 
 
+def lane_polynomial_slope(coefficients, z):
+    """Evaluate dx/dz for coefficients stored as [a0, a1, a2, ...]."""
+    z = np.asarray(z, dtype=np.float64)
+    slope = np.zeros_like(z, dtype=np.float64)
+
+    for power, coefficient in enumerate(coefficients[1:], start=1):
+        slope += power * coefficient * z ** (power - 1)
+
+    return slope
+
+
 def fit_lane_stream(graph, stream, cfg=None):
     """
     Robustly fit a polynomial lane centreline x(z) to one candidate stream.
 
-    The returned coefficients are ordered [a0, a1, a2, ...], so a
-    quadratic fit represents x(z) = a0 + a1*z + a2*z^2.
+    Coefficients are returned as [a0, a1, a2, ...], so a quadratic is
+    x(z) = a0 + a1*z + a2*z^2.
     """
     if cfg is None:
         cfg = LaneFitConfig()
@@ -208,7 +223,6 @@ def fit_lane_stream(graph, stream, cfg=None):
     x = np.array([graph.nodes[node]["x"] for node in nodes], dtype=np.float64)
     scores = np.array([graph.nodes[node]["score"] for node in nodes], dtype=np.float64)
 
-    # A quadratic needs three points. With only two vehicles, fall back to a line.
     degree = min(cfg.degree, len(nodes) - 1)
     sample_size = degree + 1
     rng = np.random.default_rng(cfg.random_seed)
@@ -216,9 +230,6 @@ def fit_lane_stream(graph, stream, cfg=None):
     best_mask = None
     best_inlier_count = -1
     best_rmse = np.inf
-
-    # If the stream only has the minimum number of points, there is nothing
-    # for RANSAC to reject, so fit all points directly.
     trials = 1 if len(nodes) == sample_size else cfg.max_trials
 
     for _ in range(trials):
@@ -227,7 +238,6 @@ def fit_lane_stream(graph, stream, cfg=None):
         else:
             sample_idx = rng.choice(len(nodes), size=sample_size, replace=False)
 
-        # Repeated/near-identical z values make the polynomial poorly defined.
         if np.unique(z[sample_idx]).size < sample_size:
             continue
 
@@ -245,7 +255,6 @@ def fit_lane_stream(graph, stream, cfg=None):
             continue
 
         rmse = float(np.sqrt(np.mean((x[inlier_mask] - predicted[inlier_mask]) ** 2)))
-
         if (
             inlier_count > best_inlier_count
             or (inlier_count == best_inlier_count and rmse < best_rmse)
@@ -257,8 +266,6 @@ def fit_lane_stream(graph, stream, cfg=None):
     if best_mask is None:
         return None
 
-    # Refit using every RANSAC inlier. Higher-confidence detections receive
-    # slightly more influence in the final least-squares estimate.
     inlier_z = z[best_mask]
     inlier_x = x[best_mask]
     inlier_weights = np.sqrt(np.clip(scores[best_mask], 1e-6, None))
@@ -275,18 +282,13 @@ def fit_lane_stream(graph, stream, cfg=None):
 
     final_prediction = np.polyval(final_desc, inlier_z)
     rmse = float(np.sqrt(np.mean((inlier_x - final_prediction) ** 2)))
-
-    # np.polyfit returns descending powers; expose the more readable
-    # [a0, a1, a2, ...] convention to the rest of the lane pipeline.
     coefficients = final_desc[::-1].copy()
-    inlier_nodes = [node for node, keep in zip(nodes, best_mask) if keep]
-    outlier_nodes = [node for node, keep in zip(nodes, best_mask) if not keep]
 
     return {
         "degree": degree,
         "coefficients": coefficients,
-        "inliers": inlier_nodes,
-        "outliers": outlier_nodes,
+        "inliers": [node for node, keep in zip(nodes, best_mask) if keep],
+        "outliers": [node for node, keep in zip(nodes, best_mask) if not keep],
         "rmse": rmse,
         "z_min": float(inlier_z.min()),
         "z_max": float(inlier_z.max()),
@@ -304,6 +306,104 @@ def fit_lane_streams(graph, streams, cfg=None):
             fits.append(fit)
 
     return fits
+
+
+def _average_polynomials(coefficients_a, coefficients_b):
+    """Return the pointwise midpoint polynomial between two x(z) curves."""
+    degree = max(len(coefficients_a), len(coefficients_b))
+    a = np.pad(np.asarray(coefficients_a, dtype=np.float64), (0, degree - len(coefficients_a)))
+    b = np.pad(np.asarray(coefficients_b, dtype=np.float64), (0, degree - len(coefficients_b)))
+    return 0.5 * (a + b)
+
+
+def infer_lane_boundaries(lane_fits, cfg=None):
+    """
+    Infer shared lane boundaries between adjacent fitted lane streams.
+
+    A candidate pair must overlap in z and have a plausible lane-centre
+    separation. The inferred marking is the midpoint curve between the two
+    centrelines over their shared depth range.
+    """
+    if cfg is None:
+        cfg = LaneBoundaryConfig()
+
+    boundaries = []
+
+    for i in range(len(lane_fits)):
+        fit_a = lane_fits[i]
+
+        for j in range(i + 1, len(lane_fits)):
+            fit_b = lane_fits[j]
+
+            z_min = max(fit_a["z_min"], fit_b["z_min"])
+            z_max = min(fit_a["z_max"], fit_b["z_max"])
+            overlap = z_max - z_min
+
+            if overlap < cfg.min_overlap:
+                continue
+
+            z_samples = np.linspace(z_min, z_max, cfg.sample_count)
+            x_a = evaluate_lane_polynomial(fit_a["coefficients"], z_samples)
+            x_b = evaluate_lane_polynomial(fit_b["coefficients"], z_samples)
+
+            # Determine left/right using the median lateral ordering. Reject
+            # crossing centrelines because they are not a stable adjacent pair.
+            delta_x = x_b - x_a
+            median_delta = float(np.median(delta_x))
+            if abs(median_delta) < 1e-6:
+                continue
+
+            same_order = np.sign(delta_x) == np.sign(median_delta)
+            if np.mean(same_order) < 0.9:
+                continue
+
+            if median_delta > 0:
+                left_fit, right_fit = fit_a, fit_b
+                x_left, x_right = x_a, x_b
+            else:
+                left_fit, right_fit = fit_b, fit_a
+                x_left, x_right = x_b, x_a
+
+            # Correct the simple x-gap by the average lane slope so the width
+            # is measured approximately along the local normal direction.
+            slope_left = lane_polynomial_slope(left_fit["coefficients"], z_samples)
+            slope_right = lane_polynomial_slope(right_fit["coefficients"], z_samples)
+            mean_slope = 0.5 * (slope_left + slope_right)
+
+            x_gap = x_right - x_left
+            normal_width = x_gap / np.sqrt(1.0 + mean_slope ** 2)
+            median_width = float(np.median(normal_width))
+            width_std = float(np.std(normal_width))
+
+            if not (cfg.min_lane_width <= median_width <= cfg.max_lane_width):
+                continue
+
+            boundary_coefficients = _average_polynomials(
+                left_fit["coefficients"],
+                right_fit["coefficients"],
+            )
+
+            boundaries.append({
+                "left_stream_id": left_fit["stream_id"],
+                "right_stream_id": right_fit["stream_id"],
+                "coefficients": boundary_coefficients,
+                "z_min": float(z_min),
+                "z_max": float(z_max),
+                "overlap": float(overlap),
+                "lane_width": median_width,
+                "lane_width_std": width_std,
+            })
+
+    # Present boundaries from left to right at the middle of their visible span.
+    boundaries.sort(
+        key=lambda boundary: float(
+            evaluate_lane_polynomial(
+                boundary["coefficients"],
+                0.5 * (boundary["z_min"] + boundary["z_max"]),
+            )
+        )
+    )
+    return boundaries
 
 
 def _vehicle_rectangle(x, z, yaw, length, width):
@@ -327,13 +427,14 @@ def plot_lane_graph(
     graph,
     streams=None,
     lane_fits=None,
+    lane_boundaries=None,
     max_depth=60.0,
     x_range=(-15.0, 15.0),
     show_labels=True,
     save_path=None,
     show=True,
 ):
-    """Plot FCOS3D vehicle detections and their lane-compatibility graph in BEV."""
+    """Plot vehicles, compatibility graph, fitted centrelines, and inferred boundaries in BEV."""
     if streams is None:
         streams = [list(component) for component in nx.connected_components(graph)]
 
@@ -351,7 +452,6 @@ def plot_lane_graph(
         vi = graph.nodes[i]
         vj = graph.nodes[j]
         linewidth = 0.5 + 3.0 * edge.get("weight", 1.0)
-
         ax.plot(
             [vi["x"], vj["x"]],
             [vi["z"], vj["z"]],
@@ -398,12 +498,12 @@ def plot_lane_graph(
     if lane_fits is not None:
         for fit in lane_fits:
             z_curve = np.linspace(fit["z_min"], fit["z_max"], 100)
-            x_curve = _evaluate_polynomial(fit["coefficients"], z_curve)
+            x_curve = evaluate_lane_polynomial(fit["coefficients"], z_curve)
             ax.plot(
                 x_curve,
                 z_curve,
                 linewidth=3,
-                label=f"lane fit S{fit['stream_id']}",
+                label=f"centre S{fit['stream_id']}",
             )
 
             for node in fit["outliers"]:
@@ -416,13 +516,32 @@ def plot_lane_graph(
                     linewidths=2,
                 )
 
+    if lane_boundaries is not None:
+        for boundary in lane_boundaries:
+            z_curve = np.linspace(boundary["z_min"], boundary["z_max"], 100)
+            x_curve = evaluate_lane_polynomial(boundary["coefficients"], z_curve)
+            ax.plot(
+                x_curve,
+                z_curve,
+                linestyle="--",
+                linewidth=3,
+                label=(
+                    f"boundary S{boundary['left_stream_id']}|"
+                    f"S{boundary['right_stream_id']}"
+                ),
+            )
+
     ax.set_xlim(*x_range)
     ax.set_ylim(0, max_depth)
     ax.set_xlabel("Lateral x [m]")
     ax.set_ylabel("Forward z [m]")
-    ax.set_title("FCOS3D lane-stream compatibility graph")
+    ax.set_title("FCOS3D lane-stream graph and inferred boundaries")
     ax.grid(True, alpha=0.3)
     ax.set_aspect("equal", adjustable="box")
+
+    if lane_fits or lane_boundaries:
+        ax.legend(loc="best")
+
     plt.tight_layout()
 
     if save_path is not None:
