@@ -1,8 +1,10 @@
 from mmdet3d.apis import inference_mono_3d_detector, init_model
 
 from lane_graph import (
+    LaneFitConfig,
     LaneGraphConfig,
     build_lane_compatibility_graph,
+    fit_lane_streams,
     get_lane_streams,
     plot_lane_graph,
     print_graph_edges,
@@ -39,6 +41,13 @@ GRAPH_CONFIG = LaneGraphConfig(
     max_along_track=25.0,
     sigma_cross_track=0.8,
     sigma_yaw_deg=8.0,
+)
+
+FIT_CONFIG = LaneFitConfig(
+    degree=2,
+    residual_threshold=0.75,
+    max_trials=200,
+    random_seed=0,
 )
 
 
@@ -97,13 +106,6 @@ def main():
     print_graph_edges(graph)
 
     streams = get_lane_streams(graph, min_vehicles=2)
-    plot_lane_graph(
-        graph,
-        streams=streams,
-        max_depth=50.0,
-        x_range=(-12.0, 12.0),
-        save_path="lane_graph_bev.png",
-    )
 
     print("\n========================================")
     print("CANDIDATE LANE STREAMS")
@@ -112,6 +114,8 @@ def main():
     if not streams:
         print("No multi-vehicle streams found.")
         return
+
+    lane_fits = fit_lane_streams(graph, streams, cfg=FIT_CONFIG)
 
     for stream_idx, stream in enumerate(streams):
         stream = sorted(stream, key=lambda node: graph.nodes[node]["z"])
@@ -126,6 +130,30 @@ def main():
                 f"yaw={vehicle['yaw']:7.3f} "
                 f"score={vehicle['score']:.3f}"
             )
+
+    print("\n========================================")
+    print("ROBUST LANE FITS")
+    print("========================================")
+
+    for fit in lane_fits:
+        coeff_text = ", ".join(f"{value:.5f}" for value in fit["coefficients"])
+        print(
+            f"Stream {fit['stream_id']}: "
+            f"degree={fit['degree']} | "
+            f"coefficients=[{coeff_text}] | "
+            f"RMSE={fit['rmse']:.3f} m | "
+            f"inliers={fit['inliers']} | "
+            f"outliers={fit['outliers']}"
+        )
+
+    plot_lane_graph(
+        graph,
+        streams=streams,
+        lane_fits=lane_fits,
+        max_depth=50.0,
+        x_range=(-12.0, 12.0),
+        save_path="lane_graph_bev.png",
+    )
 
 
 if __name__ == "__main__":

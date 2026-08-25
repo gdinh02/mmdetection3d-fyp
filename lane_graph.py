@@ -22,6 +22,16 @@ class LaneGraphConfig:
     sigma_yaw_deg: float = 8.0
 
 
+@dataclass
+class LaneFitConfig:
+    """Settings for robustly fitting a lane centreline x(z)."""
+
+    degree: int = 2
+    residual_threshold: float = 0.75
+    max_trials: int = 200
+    random_seed: int = 0
+
+
 def axial_angle_diff(a, b):
     """Return orientation difference in [0, pi/2], treating theta and theta+pi as equivalent."""
     diff = np.mod(np.abs(a - b), np.pi)
@@ -169,6 +179,133 @@ def print_graph_edges(graph):
         )
 
 
+def _evaluate_polynomial(coefficients, z):
+    """Evaluate x(z) for coefficients stored as [a0, a1, a2, ...]."""
+    z = np.asarray(z, dtype=np.float64)
+    x = np.zeros_like(z, dtype=np.float64)
+
+    for power, coefficient in enumerate(coefficients):
+        x += coefficient * z ** power
+
+    return x
+
+
+def fit_lane_stream(graph, stream, cfg=None):
+    """
+    Robustly fit a polynomial lane centreline x(z) to one candidate stream.
+
+    The returned coefficients are ordered [a0, a1, a2, ...], so a
+    quadratic fit represents x(z) = a0 + a1*z + a2*z^2.
+    """
+    if cfg is None:
+        cfg = LaneFitConfig()
+
+    nodes = sorted(stream, key=lambda node: graph.nodes[node]["z"])
+    if len(nodes) < 2:
+        return None
+
+    z = np.array([graph.nodes[node]["z"] for node in nodes], dtype=np.float64)
+    x = np.array([graph.nodes[node]["x"] for node in nodes], dtype=np.float64)
+    scores = np.array([graph.nodes[node]["score"] for node in nodes], dtype=np.float64)
+
+    # A quadratic needs three points. With only two vehicles, fall back to a line.
+    degree = min(cfg.degree, len(nodes) - 1)
+    sample_size = degree + 1
+    rng = np.random.default_rng(cfg.random_seed)
+
+    best_mask = None
+    best_inlier_count = -1
+    best_rmse = np.inf
+
+    # If the stream only has the minimum number of points, there is nothing
+    # for RANSAC to reject, so fit all points directly.
+    trials = 1 if len(nodes) == sample_size else cfg.max_trials
+
+    for _ in range(trials):
+        if len(nodes) == sample_size:
+            sample_idx = np.arange(len(nodes))
+        else:
+            sample_idx = rng.choice(len(nodes), size=sample_size, replace=False)
+
+        # Repeated/near-identical z values make the polynomial poorly defined.
+        if np.unique(z[sample_idx]).size < sample_size:
+            continue
+
+        try:
+            poly_desc = np.polyfit(z[sample_idx], x[sample_idx], degree)
+        except (np.linalg.LinAlgError, ValueError):
+            continue
+
+        predicted = np.polyval(poly_desc, z)
+        residuals = np.abs(x - predicted)
+        inlier_mask = residuals <= cfg.residual_threshold
+        inlier_count = int(inlier_mask.sum())
+
+        if inlier_count < sample_size:
+            continue
+
+        rmse = float(np.sqrt(np.mean((x[inlier_mask] - predicted[inlier_mask]) ** 2)))
+
+        if (
+            inlier_count > best_inlier_count
+            or (inlier_count == best_inlier_count and rmse < best_rmse)
+        ):
+            best_mask = inlier_mask
+            best_inlier_count = inlier_count
+            best_rmse = rmse
+
+    if best_mask is None:
+        return None
+
+    # Refit using every RANSAC inlier. Higher-confidence detections receive
+    # slightly more influence in the final least-squares estimate.
+    inlier_z = z[best_mask]
+    inlier_x = x[best_mask]
+    inlier_weights = np.sqrt(np.clip(scores[best_mask], 1e-6, None))
+
+    try:
+        final_desc = np.polyfit(
+            inlier_z,
+            inlier_x,
+            degree,
+            w=inlier_weights,
+        )
+    except (np.linalg.LinAlgError, ValueError):
+        return None
+
+    final_prediction = np.polyval(final_desc, inlier_z)
+    rmse = float(np.sqrt(np.mean((inlier_x - final_prediction) ** 2)))
+
+    # np.polyfit returns descending powers; expose the more readable
+    # [a0, a1, a2, ...] convention to the rest of the lane pipeline.
+    coefficients = final_desc[::-1].copy()
+    inlier_nodes = [node for node, keep in zip(nodes, best_mask) if keep]
+    outlier_nodes = [node for node, keep in zip(nodes, best_mask) if not keep]
+
+    return {
+        "degree": degree,
+        "coefficients": coefficients,
+        "inliers": inlier_nodes,
+        "outliers": outlier_nodes,
+        "rmse": rmse,
+        "z_min": float(inlier_z.min()),
+        "z_max": float(inlier_z.max()),
+    }
+
+
+def fit_lane_streams(graph, streams, cfg=None):
+    """Fit every candidate stream and return only successful lane fits."""
+    fits = []
+
+    for stream_id, stream in enumerate(streams):
+        fit = fit_lane_stream(graph, stream, cfg=cfg)
+        if fit is not None:
+            fit["stream_id"] = stream_id
+            fits.append(fit)
+
+    return fits
+
+
 def _vehicle_rectangle(x, z, yaw, length, width):
     """Return the four corners of an oriented vehicle rectangle in BEV."""
     heading = heading_from_yaw(yaw)
@@ -189,6 +326,7 @@ def _vehicle_rectangle(x, z, yaw, length, width):
 def plot_lane_graph(
     graph,
     streams=None,
+    lane_fits=None,
     max_depth=60.0,
     x_range=(-15.0, 15.0),
     show_labels=True,
@@ -256,6 +394,27 @@ def plot_lane_graph(
                 f"{node}\nS{stream_id}\n{vehicle['score']:.2f}",
                 fontsize=9,
             )
+
+    if lane_fits is not None:
+        for fit in lane_fits:
+            z_curve = np.linspace(fit["z_min"], fit["z_max"], 100)
+            x_curve = _evaluate_polynomial(fit["coefficients"], z_curve)
+            ax.plot(
+                x_curve,
+                z_curve,
+                linewidth=3,
+                label=f"lane fit S{fit['stream_id']}",
+            )
+
+            for node in fit["outliers"]:
+                vehicle = graph.nodes[node]
+                ax.scatter(
+                    vehicle["x"],
+                    vehicle["z"],
+                    marker="x",
+                    s=100,
+                    linewidths=2,
+                )
 
     ax.set_xlim(*x_range)
     ax.set_ylim(0, max_depth)
