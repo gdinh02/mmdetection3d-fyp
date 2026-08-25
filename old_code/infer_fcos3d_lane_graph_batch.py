@@ -14,7 +14,7 @@ from mmdet3d.structures import get_box_type
 
 from nuscenes.nuscenes import NuScenes
 
-from lane_graph import (
+from old_code.lane_graph import (
     LaneGraphConfig,
     build_lane_compatibility_graph,
     get_lane_streams,

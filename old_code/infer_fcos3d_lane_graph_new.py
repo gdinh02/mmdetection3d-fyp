@@ -7,7 +7,7 @@ from mmdet3d.apis import (
     inference_mono_3d_detector,
 )
 
-from lane_graph import (
+from old_code.lane_graph import (
     LaneGraphConfig,
     build_lane_compatibility_graph,
     get_lane_streams,
