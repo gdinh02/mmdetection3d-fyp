@@ -16,7 +16,7 @@ import streamlit as st
 DATAROOT = Path(
     os.environ.get(
         "NUSCENES_ROOT",
-        "/mnt/z/nuscenes"
+        "/mnt/z/dataset/nuscenes"
     )
 )
 

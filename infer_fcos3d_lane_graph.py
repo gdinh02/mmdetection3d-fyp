@@ -1,9 +1,11 @@
-import tempfile
 from pathlib import Path
+import tempfile
 
 import matplotlib.pyplot as plt
 import mmengine
 import numpy as np
+from nuscenes.nuscenes import NuScenes
+from pyquaternion import Quaternion
 
 from mmdet3d.apis import inference_mono_3d_detector, init_model
 
@@ -38,19 +40,19 @@ CHECKPOINT = (
     "20210717_095645-8d806dc2.pth"
 )
 
-# This can be the existing one-frame demo info or a normal nuScenes info file
-# containing many consecutive samples. With one sample, the script naturally
-# falls back to single-frame behaviour.
-SEQUENCE_INFO_FILE = (
-    "demo/data/nuscenes/"
-    "n008-2018-08-01-15-16-36-0400__CAM_FRONT__1533151621912404.pkl"
-)
-DATA_ROOT = "data/nuscenes"
-REFERENCE_FRAME_INDEX = -1
-
-DEVICE = "cuda:0"
+NUSCENES_ROOT = Path("/mnt/z/dataset/scene-0064")
+NUSCENES_VERSION = None  # auto-detect trainval / mini / test
 CAM_TYPE = "CAM_FRONT"
+DEVICE = "cuda:0"
 WANTED_VEHICLE_CLASSES = {"car", "truck", "bus"}
+
+# Selection priority: SCENE_TOKEN -> SCENE_NAME -> SCENE_INDEX.
+SCENE_TOKEN = None
+SCENE_NAME = None
+SCENE_INDEX = 64
+
+# Keyframe within the selected scene. -1 = final keyframe.
+REFERENCE_SAMPLE_INDEX = -1
 
 GRAPH_CONFIG = LaneGraphConfig(
     score_thresh=0.30,
@@ -69,8 +71,6 @@ TEMPORAL_CONFIG = TemporalConfig(
     max_track_frame_gap=1,
     temporal_decay=0.90,
     min_track_observations=1,
-    max_reference_distance=60.0,
-    max_time_gap_s=3.0,
 )
 
 FIT_CONFIG = LaneFitConfig(
@@ -81,7 +81,7 @@ FIT_CONFIG = LaneFitConfig(
 )
 
 BOUNDARY_CONFIG = LaneBoundaryConfig(
-    min_overlap=10.0,
+    min_overlap=2.0,
     min_lane_width=2.5,
     max_lane_width=5.0,
     sample_count=50,
@@ -99,124 +99,152 @@ PROJECTION_CONFIG = LaneProjectionConfig(
     clip_to_image=True,
 )
 
-
-def _resolve_reference_index(length, index):
-    resolved = index if index >= 0 else length + index
-    if resolved < 0 or resolved >= length:
-        raise IndexError(f"REFERENCE_FRAME_INDEX {index} is outside 0..{length - 1}")
-    return resolved
-
-
-def _camera_to_global(sample, cam_type):
-    """Return the 4x4 camera-to-global pose for one nuScenes sample."""
-    ego2global = np.asarray(sample["ego2global"], dtype=np.float64)
-    cam2ego = np.asarray(sample["images"][cam_type]["cam2ego"], dtype=np.float64)
-
-    if ego2global.shape != (4, 4) or cam2ego.shape != (4, 4):
-        raise ValueError("ego2global and cam2ego must both be 4x4 matrices")
-
-    return ego2global @ cam2ego
+NUSCENES_CLASSES = (
+    "car",
+    "truck",
+    "trailer",
+    "bus",
+    "construction_vehicle",
+    "bicycle",
+    "motorcycle",
+    "pedestrian",
+    "traffic_cone",
+    "barrier",
+)
 
 
-def _timestamp_seconds(sample):
-    timestamp = sample.get("timestamp")
-    if timestamp is None:
-        return None
+def detect_nuscenes_version(root):
+    if NUSCENES_VERSION is not None:
+        version_dir = root / NUSCENES_VERSION
+        if not version_dir.is_dir():
+            raise FileNotFoundError(f"Missing nuScenes metadata: {version_dir}")
+        return NUSCENES_VERSION
 
-    # nuScenes timestamps are normally in microseconds.
-    timestamp = float(timestamp)
-    return timestamp / 1e6 if abs(timestamp) > 1e9 else timestamp
-
-
-def _select_temporal_samples(sequence_info, reference_index, cfg):
-    """Select recent frames that plausibly belong to the reference scene."""
-    data_list = sequence_info["data_list"]
-    ref_idx = _resolve_reference_index(len(data_list), reference_index)
-    reference = data_list[ref_idx]
-    reference_pose = np.asarray(reference["ego2global"], dtype=np.float64)
-    reference_position = reference_pose[:3, 3]
-    reference_time = _timestamp_seconds(reference)
-    reference_scene = reference.get("scene_token")
-
-    start = max(0, ref_idx - cfg.history_frames + 1)
-    selected = []
-
-    for frame_idx in range(start, ref_idx + 1):
-        sample = data_list[frame_idx]
-
-        if CAM_TYPE not in sample.get("images", {}):
-            continue
-
-        sample_scene = sample.get("scene_token")
-        if reference_scene is not None and sample_scene is not None:
-            if sample_scene != reference_scene:
-                continue
-
-        pose = np.asarray(sample["ego2global"], dtype=np.float64)
-        ego_distance = float(np.linalg.norm(pose[:3, 3] - reference_position))
-        if ego_distance > cfg.max_reference_distance:
-            continue
-
-        sample_time = _timestamp_seconds(sample)
-        if reference_time is not None and sample_time is not None:
-            if abs(reference_time - sample_time) > cfg.max_time_gap_s:
-                continue
-
-        selected.append((frame_idx, sample))
-
-    if not selected or selected[-1][0] != ref_idx:
-        selected.append((ref_idx, reference))
-
-    selected.sort(key=lambda item: item[0])
-    return selected, ref_idx
-
-
-def _resolve_image_path(sample, cam_type, info_file, data_root):
-    image_path = Path(sample["images"][cam_type]["img_path"])
-    candidates = [
-        image_path,
-        Path(data_root) / image_path,
-        Path(info_file).resolve().parent / image_path,
-    ]
-
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
+    for version in ("v1.0-trainval", "v1.0-mini", "v1.0-test"):
+        if (root / version).is_dir():
+            return version
 
     raise FileNotFoundError(
-        "Could not resolve image path from info entry. Tried:\n  "
-        + "\n  ".join(str(candidate) for candidate in candidates)
+        f"No nuScenes metadata folder found under {root}. Expected "
+        "v1.0-trainval, v1.0-mini, or v1.0-test."
     )
 
 
-def _write_single_sample_info(sequence_info, sample, path):
-    """Create the one-sample annotation file expected by mono-3D inference."""
-    single = {
-        key: value
-        for key, value in sequence_info.items()
-        if key != "data_list"
+def make_transform(translation, rotation):
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = Quaternion(rotation).rotation_matrix
+    transform[:3, 3] = np.asarray(translation, dtype=np.float64)
+    return transform
+
+
+def choose_scene(nusc):
+    if SCENE_TOKEN is not None:
+        return nusc.get("scene", SCENE_TOKEN)
+
+    if SCENE_NAME is not None:
+        matches = [scene for scene in nusc.scene if scene["name"] == SCENE_NAME]
+        if not matches:
+            raise ValueError(f"No scene named {SCENE_NAME!r}")
+        return matches[0]
+
+    if not 0 <= SCENE_INDEX < len(nusc.scene):
+        raise IndexError(f"SCENE_INDEX must be in 0..{len(nusc.scene) - 1}")
+    return nusc.scene[SCENE_INDEX]
+
+
+def scene_samples(nusc, scene):
+    samples = []
+    token = scene["first_sample_token"]
+    while token:
+        sample = nusc.get("sample", token)
+        samples.append(sample)
+        token = sample["next"]
+    return samples
+
+
+def select_temporal_window(samples):
+    reference_idx = (
+        REFERENCE_SAMPLE_INDEX
+        if REFERENCE_SAMPLE_INDEX >= 0
+        else len(samples) + REFERENCE_SAMPLE_INDEX
+    )
+    if reference_idx < 0 or reference_idx >= len(samples):
+        raise IndexError(
+            f"REFERENCE_SAMPLE_INDEX={REFERENCE_SAMPLE_INDEX} is outside "
+            f"0..{len(samples) - 1}"
+        )
+    start = max(0, reference_idx - TEMPORAL_CONFIG.history_frames + 1)
+    return list(enumerate(samples[start : reference_idx + 1], start=start))
+
+
+def build_mmdet_sample_info(nusc, sample, sample_idx):
+    cam_token = sample["data"][CAM_TYPE]
+    sample_data = nusc.get("sample_data", cam_token)
+    calibrated_sensor = nusc.get(
+        "calibrated_sensor", sample_data["calibrated_sensor_token"]
+    )
+    ego_pose = nusc.get("ego_pose", sample_data["ego_pose_token"])
+
+    image_path = Path(nusc.get_sample_data_path(cam_token)).resolve()
+    cam2ego = make_transform(
+        calibrated_sensor["translation"], calibrated_sensor["rotation"]
+    )
+    ego2global = make_transform(ego_pose["translation"], ego_pose["rotation"])
+    cam2img = np.asarray(calibrated_sensor["camera_intrinsic"], dtype=np.float64)
+
+    info = {
+        "sample_idx": sample_idx,
+        "token": sample["token"],
+        "timestamp": sample_data["timestamp"],
+        "ego2global": ego2global.tolist(),
+        "images": {
+            CAM_TYPE: {
+                "img_path": str(image_path),
+                "cam2img": cam2img.tolist(),
+                "sample_data_token": cam_token,
+                "timestamp": sample_data["timestamp"],
+                "cam2ego": cam2ego.tolist(),
+            }
+        },
+        "instances": [],
     }
-    single["data_list"] = [sample]
-    mmengine.dump(single, path)
+    return info, str(image_path)
 
 
-def _run_temporal_inference(model, sequence_info, selected_frames, vehicle_label_ids):
+def write_single_sample_info(info, path):
+    mmengine.dump(
+        {
+            "metainfo": {
+                "classes": NUSCENES_CLASSES,
+                "dataset": "NuScenesDataset",
+                "info_version": "1.1",
+            },
+            "data_list": [info],
+        },
+        path,
+    )
+
+
+def camera_to_global(info):
+    ego2global = np.asarray(info["ego2global"], dtype=np.float64)
+    cam2ego = np.asarray(info["images"][CAM_TYPE]["cam2ego"], dtype=np.float64)
+    return ego2global @ cam2ego
+
+
+def run_temporal_inference(model, nusc, selected_samples, vehicle_label_ids):
     frame_records = []
 
-    with tempfile.TemporaryDirectory(prefix="fcos3d_temporal_") as temp_dir:
-        for order, (frame_idx, sample) in enumerate(selected_frames):
-            image_path = _resolve_image_path(
-                sample,
-                CAM_TYPE,
-                SEQUENCE_INFO_FILE,
-                DATA_ROOT,
+    with tempfile.TemporaryDirectory(prefix="fcos3d_nuscenes_") as temp_dir:
+        for order, (scene_sample_idx, sample) in enumerate(selected_samples):
+            info, image_path = build_mmdet_sample_info(
+                nusc, sample, sample_idx=scene_sample_idx
             )
-            one_frame_info = Path(temp_dir) / f"frame_{frame_idx}.pkl"
-            _write_single_sample_info(sequence_info, sample, one_frame_info)
+            one_frame_info = Path(temp_dir) / f"frame_{scene_sample_idx:04d}.pkl"
+            write_single_sample_info(info, one_frame_info)
 
             print(
-                f"Frame {order + 1}/{len(selected_frames)} "
-                f"(data_list[{frame_idx}]): {image_path}"
+                f"Frame {order + 1}/{len(selected_samples)} "
+                f"(scene sample {scene_sample_idx}):\n  {image_path}"
             )
             result = inference_mono_3d_detector(
                 model,
@@ -226,19 +254,19 @@ def _run_temporal_inference(model, sequence_info, selected_frames, vehicle_label
             )
             pred = result.pred_instances_3d
             vehicles = extract_vehicles_from_prediction(
-                pred,
-                vehicle_label_ids,
-                cfg=GRAPH_CONFIG,
+                pred, vehicle_label_ids, cfg=GRAPH_CONFIG
             )
 
-            frame_records.append({
-                "frame_index": frame_idx,
-                "sample": sample,
-                "image_path": image_path,
-                "pred": pred,
-                "vehicles": vehicles,
-                "cam_to_global": _camera_to_global(sample, CAM_TYPE),
-            })
+            frame_records.append(
+                {
+                    "frame_index": scene_sample_idx,
+                    "sample": info,
+                    "image_path": image_path,
+                    "pred": pred,
+                    "vehicles": vehicles,
+                    "cam_to_global": camera_to_global(info),
+                }
+            )
             print(
                 f"  raw detections={len(pred.bboxes_3d)} | "
                 f"usable vehicles={len(vehicles)}"
@@ -248,134 +276,97 @@ def _run_temporal_inference(model, sequence_info, selected_frames, vehicle_label
 
 
 def main():
-    print("Loading FCOS3D...")
-    model = init_model(CONFIG, CHECKPOINT, device=DEVICE)
-    print("Model loaded.")
+    if not NUSCENES_ROOT.is_dir():
+        raise FileNotFoundError(
+            f"nuScenes root does not exist: {NUSCENES_ROOT}\n"
+            "Mount the dataset there or change NUSCENES_ROOT."
+        )
 
+    version = detect_nuscenes_version(NUSCENES_ROOT)
+    nusc = NuScenes(version=version, dataroot=str(NUSCENES_ROOT), verbose=True)
+    scene = choose_scene(nusc)
+    samples = scene_samples(nusc, scene)
+    selected_samples = select_temporal_window(samples)
+
+    print("\n========================================")
+    print("SCENE")
+    print("========================================")
+    print(f"root:        {NUSCENES_ROOT}")
+    print(f"version:     {version}")
+    print(f"name:        {scene['name']}")
+    print(f"token:       {scene['token']}")
+    print(f"description: {scene.get('description', '')}")
+    print(f"keyframes:   {len(samples)}")
+    print(
+        f"window:      {selected_samples[0][0]}..{selected_samples[-1][0]} "
+        f"({len(selected_samples)} frames)"
+    )
+
+    print("\nLoading FCOS3D...")
+    model = init_model(CONFIG, CHECKPOINT, device=DEVICE)
     class_names = model.dataset_meta["classes"]
     vehicle_label_ids = {
         class_id
         for class_id, name in enumerate(class_names)
         if name in WANTED_VEHICLE_CLASSES
     }
-    print("Vehicle class IDs:", vehicle_label_ids)
 
-    sequence_info = mmengine.load(SEQUENCE_INFO_FILE)
-    selected_frames, reference_index = _select_temporal_samples(
-        sequence_info,
-        REFERENCE_FRAME_INDEX,
-        TEMPORAL_CONFIG,
-    )
-
-    print("\n========================================")
-    print("TEMPORAL WINDOW")
-    print("========================================")
-    print(f"Selected frames: {len(selected_frames)}")
-    print(f"Reference index: data_list[{reference_index}]")
-
-    frame_records = _run_temporal_inference(
-        model,
-        sequence_info,
-        selected_frames,
-        vehicle_label_ids,
+    frame_records = run_temporal_inference(
+        model, nusc, selected_samples, vehicle_label_ids
     )
 
     temporal_vehicles, tracks = accumulate_temporal_vehicle_evidence(
-        frame_records,
-        reference_record_index=-1,
-        cfg=TEMPORAL_CONFIG,
+        frame_records, reference_record_index=-1, cfg=TEMPORAL_CONFIG
     )
-
-    # Only evidence visible in front of the reference camera contributes to
-    # the reference-frame lane model.
     temporal_vehicles = [
-        vehicle
-        for vehicle in temporal_vehicles
-        if 0.0 < vehicle["z"] <= GRAPH_CONFIG.max_depth
+        v for v in temporal_vehicles if 0.0 < v["z"] <= GRAPH_CONFIG.max_depth
     ]
 
     graph = build_lane_compatibility_graph_from_vehicles(
-        temporal_vehicles,
-        cfg=GRAPH_CONFIG,
+        temporal_vehicles, cfg=GRAPH_CONFIG
     )
-
-    print("\n========================================")
-    print("TEMPORAL VEHICLE EVIDENCE")
-    print("========================================")
-    print(f"Accumulated observations: {len(temporal_vehicles)}")
-    print(f"Tracks created:           {len(tracks)}")
-    print(f"Graph nodes:              {graph.number_of_nodes()}")
-    print(f"Graph edges:              {graph.number_of_edges()}")
-
-    for track_id, track in sorted(tracks.items()):
-        print(
-            f"track {track_id:2d}: "
-            f"observations={track['observations']} | "
-            f"class={class_names[track['label']]}"
-        )
-
-    print("\nCompatible temporal pairs:")
-    print_graph_edges(graph)
-
     streams = get_lane_streams(graph, min_vehicles=2)
     lane_fits = fit_lane_streams(graph, streams, cfg=FIT_CONFIG)
     lane_boundaries = infer_lane_boundaries(lane_fits, cfg=BOUNDARY_CONFIG)
 
     print("\n========================================")
-    print("TEMPORAL LANE FITS")
+    print("TEMPORAL VEHICLE EVIDENCE")
     print("========================================")
-    if not lane_fits:
-        print("No fitted lane streams found.")
-    else:
-        for fit in lane_fits:
-            coeff_text = ", ".join(f"{value:.5f}" for value in fit["coefficients"])
-            print(
-                f"Stream {fit['stream_id']}: "
-                f"degree={fit['degree']} | "
-                f"coefficients=[{coeff_text}] | "
-                f"RMSE={fit['rmse']:.3f} m | "
-                f"inliers={len(fit['inliers'])} | "
-                f"outliers={len(fit['outliers'])}"
-            )
+    print(f"observations: {len(temporal_vehicles)}")
+    print(f"tracks:       {len(tracks)}")
+    print(f"graph nodes:  {graph.number_of_nodes()}")
+    print(f"graph edges:  {graph.number_of_edges()}")
+    print("\nCompatible temporal pairs:")
+    print_graph_edges(graph)
 
     print("\n========================================")
-    print("INFERRED LANE BOUNDARIES")
+    print("LANE FITS / BOUNDARIES")
     print("========================================")
-    if not lane_boundaries:
-        print("No adjacent fitted streams passed the boundary checks.")
-    else:
-        for boundary_id, boundary in enumerate(lane_boundaries):
-            print(
-                f"Boundary {boundary_id}: "
-                f"S{boundary['left_stream_id']}|S{boundary['right_stream_id']} | "
-                f"width={boundary['lane_width']:.2f} m | "
-                f"overlap={boundary['overlap']:.1f} m"
-            )
+    print(f"lane streams: {len(streams)}")
+    print(f"lane fits:    {len(lane_fits)}")
+    print(f"boundaries:   {len(lane_boundaries)}")
 
-    # Everything above is expressed in the newest/reference camera frame, so
-    # estimate the road plane and project onto that same reference image.
     reference_record = frame_records[-1]
     road_plane = estimate_road_plane(
-        pred_instances_3d=reference_record["pred"],
-        vehicles=reference_record["vehicles"],
+        reference_record["pred"],
+        reference_record["vehicles"],
         cfg=ROAD_PLANE_CONFIG,
     )
 
     projected_boundaries = []
-    if road_plane is None:
-        print("\nCould not estimate the reference-frame road plane.")
-    else:
-        sample = reference_record["sample"]
-        cam2img = np.asarray(sample["images"][CAM_TYPE]["cam2img"])
+    if road_plane is not None:
+        cam2img = np.asarray(
+            reference_record["sample"]["images"][CAM_TYPE]["cam2img"],
+            dtype=np.float64,
+        )
         image = plt.imread(reference_record["image_path"])
         projected_boundaries = project_lane_boundaries_to_image(
-            lane_boundaries=lane_boundaries,
-            road_plane=road_plane,
-            cam2img=cam2img,
+            lane_boundaries,
+            road_plane,
+            cam2img,
             image_shape=image.shape,
             cfg=PROJECTION_CONFIG,
         )
-
         plot_projected_lane_boundaries(
             reference_record["image_path"],
             projected_boundaries,
@@ -391,11 +382,6 @@ def main():
         x_range=(-12.0, 12.0),
         save_path="temporal_lane_graph_bev.png",
     )
-
-    print("\nSaved:")
-    print("  temporal_lane_graph_bev.png")
-    if projected_boundaries:
-        print("  temporal_lane_boundaries_image.png")
 
 
 if __name__ == "__main__":
