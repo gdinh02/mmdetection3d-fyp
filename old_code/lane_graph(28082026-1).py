@@ -38,19 +38,10 @@ class LaneFitConfig:
 
 @dataclass
 class LaneBoundaryConfig:
-    min_overlap: float = 3.0
+    min_overlap: float = 10.0
     min_lane_width: float = 2.5
     max_lane_width: float = 5.0
     sample_count: int = 50
-
-    # Single-stream boundary inference
-    default_lane_width: float = 3.5
-    single_stream_min_inliers: int = 3
-    single_stream_max_rmse: float = 0.75
-    single_stream_confidence: float = 0.45
-
-    # Avoid drawing a provisional boundary on top of a stronger paired one
-    provisional_dedup_distance: float = 0.75
 
 
 @dataclass
@@ -492,57 +483,7 @@ def infer_lane_boundaries(lane_fits, cfg=None):
         cfg = LaneBoundaryConfig()
 
     boundaries = []
-    paired_boundaries = []
 
-    def boundary_separation(a, b):
-        """Median lateral separation over the shared z-range."""
-        z_min = max(a["z_min"], b["z_min"])
-        z_max = min(a["z_max"], b["z_max"])
-        if z_max <= z_min:
-            return None
-
-        z = np.linspace(z_min, z_max, cfg.sample_count)
-        x_a = evaluate_lane_polynomial(a["coefficients"], z)
-        x_b = evaluate_lane_polynomial(b["coefficients"], z)
-        return float(np.median(np.abs(x_a - x_b)))
-
-    def add_boundary(candidate):
-        """Add a boundary unless it duplicates a stronger existing one."""
-        for index, existing in enumerate(boundaries):
-            separation = boundary_separation(candidate, existing)
-            if (
-                separation is not None
-                and separation < cfg.provisional_dedup_distance
-            ):
-                if candidate["confidence"] > existing["confidence"]:
-                    boundaries[index] = candidate
-                return
-
-        boundaries.append(candidate)
-
-    def make_offset_boundary(fit, side, lane_width):
-        """Offset one fitted lane centreline by half a lane width."""
-        z = np.linspace(fit["z_min"], fit["z_max"], cfg.sample_count)
-        centre_x = evaluate_lane_polynomial(fit["coefficients"], z)
-        slope = lane_polynomial_slope(fit["coefficients"], z)
-
-        half_width = lane_width / 2.0
-        horizontal_offset = half_width * np.sqrt(1.0 + slope**2)
-
-        if side == "left":
-            boundary_x = centre_x - horizontal_offset
-        elif side == "right":
-            boundary_x = centre_x + horizontal_offset
-        else:
-            raise ValueError("side must be 'left' or 'right'")
-
-        degree = min(fit.get("degree", 2), len(z) - 1)
-        poly_desc = np.polyfit(z, boundary_x, degree)
-        return poly_desc[::-1].copy()
-
-    # ---------------------------------------------------------
-    # 1. High-confidence paired-stream boundaries
-    # ---------------------------------------------------------
     for i in range(len(lane_fits)):
         for j in range(i + 1, len(lane_fits)):
             a, b = lane_fits[i], lane_fits[j]
@@ -564,20 +505,37 @@ def infer_lane_boundaries(lane_fits, cfg=None):
                 )
                 continue
 
-            z = np.linspace(z_min, z_max, cfg.sample_count)
-            x_a = evaluate_lane_polynomial(a["coefficients"], z)
-            x_b = evaluate_lane_polynomial(b["coefficients"], z)
+            z = np.linspace(
+                z_min,
+                z_max,
+                cfg.sample_count,
+            )
+
+            x_a = evaluate_lane_polynomial(
+                a["coefficients"],
+                z,
+            )
+            x_b = evaluate_lane_polynomial(
+                b["coefficients"],
+                z,
+            )
 
             delta = x_b - x_a
             median_delta = float(np.median(delta))
             median_x_gap = float(np.median(np.abs(delta)))
 
             if abs(median_delta) < 1e-6:
-                print("  -> rejected: median lateral separation is effectively zero")
+                print(
+                    "  -> rejected: median lateral separation "
+                    "is effectively zero"
+                )
                 continue
 
             sign_consistency = float(
-                np.mean(np.sign(delta) == np.sign(median_delta))
+                np.mean(
+                    np.sign(delta)
+                    == np.sign(median_delta)
+                )
             )
 
             print(
@@ -587,8 +545,8 @@ def infer_lane_boundaries(lane_fits, cfg=None):
 
             if sign_consistency < 0.9:
                 print(
-                    "  -> rejected: streams do not maintain a consistent "
-                    "left/right ordering"
+                    "  -> rejected: streams do not maintain a "
+                    "consistent left/right ordering"
                 )
                 continue
 
@@ -599,13 +557,31 @@ def infer_lane_boundaries(lane_fits, cfg=None):
                 left, right = b, a
                 x_left, x_right = x_b, x_a
 
-            slope_left = lane_polynomial_slope(left["coefficients"], z)
-            slope_right = lane_polynomial_slope(right["coefficients"], z)
-            mean_slope = 0.5 * (slope_left + slope_right)
+            slope_left = lane_polynomial_slope(
+                left["coefficients"],
+                z,
+            )
+            slope_right = lane_polynomial_slope(
+                right["coefficients"],
+                z,
+            )
 
-            widths = (x_right - x_left) / np.sqrt(1.0 + mean_slope**2)
-            median_width = float(np.median(widths))
-            width_std = float(np.std(widths))
+            mean_slope = 0.5 * (
+                slope_left + slope_right
+            )
+
+            widths = (
+                (x_right - x_left)
+                / np.sqrt(1.0 + mean_slope**2)
+            )
+
+            median_width = float(
+                np.median(widths)
+            )
+
+            width_std = float(
+                np.std(widths)
+            )
 
             print(
                 f"  normal lane width={median_width:.2f} m | "
@@ -613,142 +589,56 @@ def infer_lane_boundaries(lane_fits, cfg=None):
             )
 
             if not (
-                cfg.min_lane_width <= median_width <= cfg.max_lane_width
+                cfg.min_lane_width
+                <= median_width
+                <= cfg.max_lane_width
             ):
                 print(
                     f"  -> rejected: lane width outside allowed range "
-                    f"[{cfg.min_lane_width:.2f}, {cfg.max_lane_width:.2f}] m"
+                    f"[{cfg.min_lane_width:.2f}, "
+                    f"{cfg.max_lane_width:.2f}] m"
                 )
                 continue
-
-            overlap_score = min(
-                1.0,
-                overlap / max(2.0 * cfg.min_overlap, 1e-6),
-            )
-            width_score = float(np.exp(-width_std / 0.5))
-            confidence = float(0.6 + 0.4 * overlap_score * width_score)
 
             boundary = {
                 "left_stream_id": left["stream_id"],
                 "right_stream_id": right["stream_id"],
                 "coefficients": _average_polynomials(
-                    left["coefficients"], right["coefficients"]
+                    left["coefficients"],
+                    right["coefficients"],
                 ),
                 "z_min": float(z_min),
                 "z_max": float(z_max),
                 "overlap": float(overlap),
                 "lane_width": median_width,
                 "lane_width_std": width_std,
-                "source": "paired_streams",
-                "confidence": confidence,
-                "side": "between",
             }
 
-            paired_boundaries.append(boundary)
-            add_boundary(boundary)
+            boundaries.append(boundary)
 
             print(
-                f"  -> ACCEPTED paired boundary "
-                f"(confidence={confidence:.2f})"
+                f"  -> ACCEPTED boundary "
+                f"S{left['stream_id']} | S{right['stream_id']}"
             )
-
-    # ---------------------------------------------------------
-    # 2. Estimate representative lane width
-    # ---------------------------------------------------------
-    if paired_boundaries:
-        estimated_lane_width = float(
-            np.median([b["lane_width"] for b in paired_boundaries])
-        )
-    else:
-        estimated_lane_width = cfg.default_lane_width
-
-    print(
-        f"\nLane width used for single-stream inference: "
-        f"{estimated_lane_width:.2f} m"
-    )
-
-    # ---------------------------------------------------------
-    # 3. Lower-confidence single-stream boundaries
-    # ---------------------------------------------------------
-    for fit in lane_fits:
-        inlier_count = len(fit.get("inliers", []))
-        rmse = float(fit.get("rmse", np.inf))
-
-        if inlier_count < cfg.single_stream_min_inliers:
-            print(
-                f"S{fit['stream_id']}: not enough inliers for "
-                f"single-stream boundaries ({inlier_count})"
-            )
-            continue
-
-        if rmse > cfg.single_stream_max_rmse:
-            print(
-                f"S{fit['stream_id']}: fit RMSE too high "
-                f"({rmse:.2f} m)"
-            )
-            continue
-
-        support_score = min(1.0, inlier_count / 5.0)
-        fit_score = float(
-            np.exp(
-                -rmse / max(cfg.single_stream_max_rmse, 1e-6)
-            )
-        )
-        provisional_confidence = float(
-            cfg.single_stream_confidence * support_score * fit_score
-        )
-
-        left_boundary = {
-            "left_stream_id": None,
-            "right_stream_id": fit["stream_id"],
-            "coefficients": make_offset_boundary(
-                fit, "left", estimated_lane_width
-            ),
-            "z_min": float(fit["z_min"]),
-            "z_max": float(fit["z_max"]),
-            "overlap": float(fit["z_max"] - fit["z_min"]),
-            "lane_width": estimated_lane_width,
-            "lane_width_std": 0.0,
-            "source": "single_stream",
-            "confidence": provisional_confidence,
-            "side": "left",
-            "source_stream_id": fit["stream_id"],
-        }
-        add_boundary(left_boundary)
-
-        right_boundary = {
-            "left_stream_id": fit["stream_id"],
-            "right_stream_id": None,
-            "coefficients": make_offset_boundary(
-                fit, "right", estimated_lane_width
-            ),
-            "z_min": float(fit["z_min"]),
-            "z_max": float(fit["z_max"]),
-            "overlap": float(fit["z_max"] - fit["z_min"]),
-            "lane_width": estimated_lane_width,
-            "lane_width_std": 0.0,
-            "source": "single_stream",
-            "confidence": provisional_confidence,
-            "side": "right",
-            "source_stream_id": fit["stream_id"],
-        }
-        add_boundary(right_boundary)
-
-        print(
-            f"S{fit['stream_id']}: added provisional left/right boundaries | "
-            f"confidence={provisional_confidence:.2f}"
-        )
 
     boundaries.sort(
         key=lambda boundary: float(
             evaluate_lane_polynomial(
                 boundary["coefficients"],
-                0.5 * (boundary["z_min"] + boundary["z_max"]),
+                0.5
+                * (
+                    boundary["z_min"]
+                    + boundary["z_max"]
+                ),
             )
         )
     )
 
-    print(f"\nTotal inferred lane boundaries: {len(boundaries)}")
+    print(
+        f"\nTotal inferred lane boundaries: "
+        f"{len(boundaries)}"
+    )
+
     return boundaries
 
 
@@ -901,10 +791,6 @@ def project_lane_boundaries_to_image(
                 "pixels": pixels[valid],
                 "points_3d": points_3d[valid],
                 "lane_width": boundary["lane_width"],
-                "source": boundary.get("source", "paired_streams"),
-                "confidence": boundary.get("confidence", 1.0),
-                "side": boundary.get("side", "between"),
-                "source_stream_id": boundary.get("source_stream_id"),
             }
         )
 
@@ -920,23 +806,14 @@ def plot_projected_lane_boundaries(
     for boundary in projected_boundaries:
         pixels = boundary["pixels"]
         if len(pixels) >= 2:
-            is_provisional = boundary.get("source") == "single_stream"
-            label = (
-                f"provisional S{boundary.get('source_stream_id')} "
-                f"{boundary.get('side', '')}"
-                if is_provisional
-                else (
-                    f"boundary S{boundary['left_stream_id']}|"
-                    f"S{boundary['right_stream_id']}"
-                )
-            )
             ax.plot(
                 pixels[:, 0],
                 pixels[:, 1],
-                linestyle=":" if is_provisional else "-",
-                linewidth=2 if is_provisional else 3,
-                alpha=max(0.25, boundary.get("confidence", 1.0)),
-                label=label,
+                linewidth=3,
+                label=(
+                    f"boundary S{boundary['left_stream_id']}|"
+                    f"S{boundary['right_stream_id']}"
+                ),
             )
     ax.set_title("Projected inferred lane boundaries")
     ax.axis("off")
@@ -1040,23 +917,15 @@ def plot_lane_graph(
         for boundary in lane_boundaries:
             z_curve = np.linspace(boundary["z_min"], boundary["z_max"], 100)
             x_curve = evaluate_lane_polynomial(boundary["coefficients"], z_curve)
-            is_provisional = boundary.get("source") == "single_stream"
-            label = (
-                f"provisional S{boundary.get('source_stream_id')} "
-                f"{boundary.get('side', '')}"
-                if is_provisional
-                else (
-                    f"boundary S{boundary['left_stream_id']}|"
-                    f"S{boundary['right_stream_id']}"
-                )
-            )
             ax.plot(
                 x_curve,
                 z_curve,
-                linestyle=":" if is_provisional else "--",
-                linewidth=2 if is_provisional else 3,
-                alpha=max(0.25, boundary.get("confidence", 1.0)),
-                label=label,
+                linestyle="--",
+                linewidth=3,
+                label=(
+                    f"boundary S{boundary['left_stream_id']}|"
+                    f"S{boundary['right_stream_id']}"
+                ),
             )
 
     ax.set_xlim(*x_range)

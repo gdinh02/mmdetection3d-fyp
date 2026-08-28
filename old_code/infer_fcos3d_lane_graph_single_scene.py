@@ -86,11 +86,6 @@ BOUNDARY_CONFIG = LaneBoundaryConfig(
     min_lane_width=2.5,
     max_lane_width=5.0,
     sample_count=50,
-    default_lane_width=3.5,
-    single_stream_min_inliers=3,
-    single_stream_max_rmse=0.75,
-    single_stream_confidence=0.45,
-    provisional_dedup_distance=0.75,
 )
 
 ROAD_PLANE_CONFIG = RoadPlaneConfig(
@@ -347,23 +342,11 @@ def main():
         print("No adjacent fitted streams passed the boundary checks.")
     else:
         for boundary_id, boundary in enumerate(lane_boundaries):
-            if boundary.get("source") == "single_stream":
-                description = (
-                    f"provisional S{boundary['source_stream_id']} "
-                    f"{boundary['side']}"
-                )
-            else:
-                description = (
-                    f"S{boundary['left_stream_id']}|"
-                    f"S{boundary['right_stream_id']}"
-                )
-
             print(
-                f"Boundary {boundary_id}: {description} | "
-                f"source={boundary.get('source', 'paired_streams')} | "
-                f"confidence={boundary.get('confidence', 1.0):.2f} | "
+                f"Boundary {boundary_id}: "
+                f"S{boundary['left_stream_id']}|S{boundary['right_stream_id']} | "
                 f"width={boundary['lane_width']:.2f} m | "
-                f"support={boundary['overlap']:.1f} m"
+                f"overlap={boundary['overlap']:.1f} m"
             )
 
     reference_record = frame_records[-1]
