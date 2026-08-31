@@ -1,4 +1,3 @@
-import argparse
 import copy
 import tempfile
 import threading
@@ -34,10 +33,6 @@ from lane_graph import (
     update_temporal_lane_tracks,
 )
 
-'''
-To run
-python live_fcos3d_lane_graph.py --max-single-streams 3
-'''
 
 # =============================================================================
 # INPUT MODE
@@ -68,8 +63,8 @@ WANTED_VEHICLE_CLASSES = {"car", "truck", "bus"}
 # SCENE REPLAY SETTINGS
 # =============================================================================
 # The scene folder only needs samples/ plus the scene-specific info pickle.
-SCENE_ROOT = Path("/mnt/z/dataset/scene-0064")
-SCENE_INFO_FILE = SCENE_ROOT / "nuscenes_infos_scene-0064.pkl"
+SCENE_ROOT = Path("/mnt/z/dataset/scene-0095")
+SCENE_INFO_FILE = SCENE_ROOT / "nuscenes_infos_scene-0095.pkl"
 
 # Playback modes:
 #   "realtime"  -> preserve timing from scene timestamps
@@ -168,19 +163,11 @@ MERGE_CONFIG = LaneMergeConfig(
 )
 
 BOUNDARY_CONFIG = LaneBoundaryConfig(
-    min_overlap=3.0,
-    min_lane_width=2.5,
-    max_lane_width=5.0,
+    min_overlap=6.0,
+    min_lane_width=2.8,
+    max_lane_width=4.2,
     sample_count=30,
     enable_single_stream_boundaries=True,
-    single_stream_only_when_no_paired=True,
-    default_lane_width=3.5,
-    single_stream_min_inliers=3,
-    single_stream_max_rmse=0.50,
-    single_stream_confidence=0.45,
-    single_stream_min_tracks=1,
-    single_stream_min_span=3.0,
-    max_single_stream_fits=2,
 )
 
 ROAD_PLANE_CONFIG = RoadPlaneConfig(
@@ -748,48 +735,13 @@ def boundary_tracking_enabled():
 # =============================================================================
 # MAIN STREAMING LOOP
 # =============================================================================
-def non_negative_int(value):
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be an integer") from exc
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("must be zero or greater")
-    return parsed
-
-
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(
-        description="Live/replay FCOS3D vehicle-stream lane inference"
-    )
-    parser.add_argument(
-        "--max-single-streams",
-        type=non_negative_int,
-        default=BOUNDARY_CONFIG.max_single_stream_fits,
-        metavar="N",
-        help=(
-            "maximum number of strongest qualifying single vehicle streams "
-            "kept when no paired-stream boundary exists (default: %(default)s; "
-            "use 0 to disable the fallback)"
-        ),
-    )
-    return parser.parse_args(argv)
-
-
-def main(argv=None):
-    args = parse_args(argv)
-    BOUNDARY_CONFIG.max_single_stream_fits = args.max_single_streams
-
+def main():
     source = create_input_source()
     history = deque(maxlen=effective_history_length())
     boundary_tracker_state = None
     previous_source_index = None
 
     print("Loading FCOS3D...")
-    print(
-        "Maximum single-stream fallbacks: "
-        f"{BOUNDARY_CONFIG.max_single_stream_fits}"
-    )
     model = init_model(str(CONFIG), str(CHECKPOINT), device=DEVICE)
     class_names = model.dataset_meta["classes"]
     vehicle_label_ids = {

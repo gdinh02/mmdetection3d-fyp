@@ -62,10 +62,15 @@ class LaneBoundaryConfig:
     sample_count: int = 50
 
     # Single-stream boundary inference
+    enable_single_stream_boundaries: bool = True
+    single_stream_only_when_no_paired: bool =True
     default_lane_width: float = 3.5
     single_stream_min_inliers: int = 3
     single_stream_max_rmse: float = 0.75
     single_stream_confidence: float = 0.45
+    single_stream_min_tracks: int = 1
+    single_stream_min_span: float = 3.0
+    max_single_stream_fits: int = 2
 
     # Avoid drawing a provisional boundary on top of a stronger paired one
     provisional_dedup_distance: float = 0.75
@@ -85,6 +90,14 @@ class BoundaryTrackingConfig:
     # Current measurement weight used for temporal smoothing.
     # 1.0 = no smoothing; smaller values retain more previous geometry.
     smoothing_alpha: float = 0.30
+
+    # A track is confirmed only after this many associated measurements.
+    # Unconfirmed tracks remain in tracker state so that they can mature.
+    min_confirmed_hits: int = 2
+
+    # Control which tracker states are emitted for projection/display.
+    emit_unconfirmed: bool = False
+    emit_predicted: bool = False
 
     # Keep an unmatched boundary alive briefly to bridge missed detections.
     max_missed_frames: int = 2
@@ -998,6 +1011,19 @@ def infer_lane_boundaries(lane_fits, cfg=None):
         f"{estimated_lane_width:.2f} m"
     )
 
+    if not cfg.enable_single_stream_boundaries:
+        boundaries.sort(
+            key=lambda boundary: float(
+                evaluate_lane_polynomial(
+                    boundary["coefficients"],
+                    0.5 * (boundary["z_min"] + boundary["z_max"]),
+                )
+            )
+        )
+        print("Single-stream provisional boundaries: disabled")
+        print(f"\nTotal inferred lane boundaries: {len(boundaries)}")
+        return boundaries
+
     # ---------------------------------------------------------
     # 3. Lower-confidence single-stream boundaries
     # ---------------------------------------------------------
@@ -1361,7 +1387,9 @@ def update_temporal_lane_tracks(
     Returns
     -------
     output_boundaries : list[dict]
-        Smoothed current measurements plus short-lived predicted boundaries.
+        Confirmed current measurements and, when configured, short-lived
+        predictions or unconfirmed measurements. All live tracks remain in
+        state even when they are suppressed from this output.
     state : dict
         Updated persistent tracker state.
     events : list[dict]
@@ -1468,7 +1496,9 @@ def update_temporal_lane_tracks(
             "hits": hits,
             "missed_frames": 0,
         }
-        output_boundaries.append(fused)
+        confirmed = hits >= cfg.min_confirmed_hits
+        if confirmed or cfg.emit_unconfirmed:
+            output_boundaries.append(fused)
         events.append(
             {
                 "type": "matched",
@@ -1507,7 +1537,9 @@ def update_temporal_lane_tracks(
             "hits": 1,
             "missed_frames": 0,
         }
-        output_boundaries.append(new_boundary)
+        confirmed = 1 >= cfg.min_confirmed_hits
+        if confirmed or cfg.emit_unconfirmed:
+            output_boundaries.append(new_boundary)
         events.append(
             {
                 "type": "new",
@@ -1564,7 +1596,9 @@ def update_temporal_lane_tracks(
             "hits": hits,
             "missed_frames": missed_frames,
         }
-        output_boundaries.append(carried)
+        confirmed = hits >= cfg.min_confirmed_hits
+        if cfg.emit_predicted and (confirmed or cfg.emit_unconfirmed):
+            output_boundaries.append(carried)
         events.append(
             {
                 "type": "predicted",
