@@ -359,7 +359,7 @@ def plot_front_and_lane_graph(
 
         weight = edge.get(
             "weight",
-            1.0,
+            5.0,
         )
 
         ax_bev.plot(

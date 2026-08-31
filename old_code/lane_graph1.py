@@ -37,24 +37,6 @@ class LaneFitConfig:
 
 
 @dataclass
-class LaneMergeConfig:
-    # Merge fragmented fits only when their longitudinal ranges are close.
-    max_longitudinal_gap: float = 8.0
-
-    # Maximum centreline disagreement over the overlap/gap comparison interval.
-    max_lateral_disagreement: float = 1.0
-
-    # Maximum tangent-angle disagreement between the two fitted centrelines.
-    max_tangent_diff_deg: float = 10.0
-
-    # Number of points used when comparing two fitted stream fragments.
-    sample_count: int = 15
-
-    # Safety cap for iterative pairwise merging.
-    max_iterations: int = 50
-
-
-@dataclass
 class LaneBoundaryConfig:
     min_overlap: float = 3.0
     min_lane_width: float = 2.5
@@ -69,30 +51,6 @@ class LaneBoundaryConfig:
 
     # Avoid drawing a provisional boundary on top of a stronger paired one
     provisional_dedup_distance: float = 0.75
-
-
-@dataclass
-class BoundaryTrackingConfig:
-    # Minimum shared forward range required to associate two boundaries.
-    min_overlap: float = 3.0
-
-    # Maximum median lateral disagreement after ego-motion compensation.
-    max_lateral_distance: float = 1.0
-
-    # Maximum tangent-angle disagreement over the common range.
-    max_tangent_diff_deg: float = 10.0
-
-    # Current measurement weight used for temporal smoothing.
-    # 1.0 = no smoothing; smaller values retain more previous geometry.
-    smoothing_alpha: float = 0.30
-
-    # Keep an unmatched boundary alive briefly to bridge missed detections.
-    max_missed_frames: int = 2
-    missing_confidence_decay: float = 0.75
-
-    sample_count: int = 60
-    min_depth: float = 1.0
-    min_points_after_transform: int = 6
 
 
 @dataclass
@@ -501,39 +459,14 @@ def fit_lane_stream(graph, stream, cfg=None):
         return None
 
     prediction = np.polyval(final_desc, inlier_z)
-    inlier_nodes = [n for n, keep in zip(nodes, best_mask) if keep]
-    outlier_nodes = [n for n, keep in zip(nodes, best_mask) if not keep]
-
-    has_track_info = any("track_id" in graph.nodes[n] for n in inlier_nodes)
-    track_ids = sorted(
-        {
-            int(graph.nodes[n]["track_id"])
-            for n in inlier_nodes
-            if graph.nodes[n].get("track_id") is not None
-        }
-    )
-    num_tracks = len(track_ids)
-
-    if not has_track_info:
-        track_support = "unknown"
-    elif num_tracks >= 2:
-        track_support = "strong"
-    else:
-        track_support = "weak"
-
     return {
         "degree": degree,
         "coefficients": final_desc[::-1].copy(),
-        "inliers": inlier_nodes,
-        "outliers": outlier_nodes,
+        "inliers": [n for n, keep in zip(nodes, best_mask) if keep],
+        "outliers": [n for n, keep in zip(nodes, best_mask) if not keep],
         "rmse": float(np.sqrt(np.mean((inlier_x - prediction) ** 2))),
         "z_min": float(inlier_z.min()),
         "z_max": float(inlier_z.max()),
-        "num_observations": len(inlier_nodes),
-        "track_ids": track_ids,
-        "num_tracks": num_tracks,
-        "has_track_info": has_track_info,
-        "track_support": track_support,
     }
 
 
@@ -543,259 +476,9 @@ def fit_lane_streams(graph, streams, cfg=None):
         fit = fit_lane_stream(graph, stream, cfg=cfg)
         if fit is not None:
             fit["stream_id"] = stream_id
-            fit["source_stream_ids"] = [stream_id]
             fits.append(fit)
     return fits
 
-
-def _fit_linear_merge_proxy(graph, fit):
-    """
-    Build a stable local x(z) line from a fit's inlier observations.
-
-    Short quadratic fits can have unstable curvature outside their observed
-    range. Stream merging therefore uses this local linear proxy only for the
-    compatibility test; the final consolidated lane is still refitted with
-    the configured RANSAC polynomial model.
-    """
-    nodes = fit.get("inliers", [])
-    if len(nodes) >= 2:
-        z = np.array([graph.nodes[n]["z"] for n in nodes], dtype=np.float64)
-        x = np.array([graph.nodes[n]["x"] for n in nodes], dtype=np.float64)
-        if np.unique(z).size >= 2:
-            weights = np.sqrt(
-                np.clip(
-                    np.array(
-                        [
-                            graph.nodes[n]["score"]
-                            * graph.nodes[n].get("evidence_weight", 1.0)
-                            for n in nodes
-                        ],
-                        dtype=np.float64,
-                    ),
-                    1e-6,
-                    None,
-                )
-            )
-            try:
-                slope, intercept = np.polyfit(z, x, 1, w=weights)
-                return float(intercept), float(slope)
-            except (np.linalg.LinAlgError, ValueError):
-                pass
-
-    # Fallback to the fitted polynomial's local tangent at its midpoint.
-    z_mid = 0.5 * (fit["z_min"] + fit["z_max"])
-    x_mid = float(evaluate_lane_polynomial(fit["coefficients"], z_mid))
-    slope = float(lane_polynomial_slope(fit["coefficients"], z_mid))
-    intercept = x_mid - slope * z_mid
-    return float(intercept), float(slope)
-
-
-def _lane_fit_comparison(graph, a, b, cfg):
-    """Compare two fitted stream fragments for same-lane compatibility."""
-    if a["z_max"] < b["z_min"]:
-        longitudinal_gap = float(b["z_min"] - a["z_max"])
-        z_start, z_end = a["z_max"], b["z_min"]
-    elif b["z_max"] < a["z_min"]:
-        longitudinal_gap = float(a["z_min"] - b["z_max"])
-        z_start, z_end = b["z_max"], a["z_min"]
-    else:
-        longitudinal_gap = 0.0
-        z_start = max(a["z_min"], b["z_min"])
-        z_end = min(a["z_max"], b["z_max"])
-
-    if longitudinal_gap > cfg.max_longitudinal_gap:
-        return {
-            "compatible": False,
-            "longitudinal_gap": longitudinal_gap,
-            "max_lateral_disagreement": np.inf,
-            "median_lateral_disagreement": np.inf,
-            "max_tangent_diff_deg": np.inf,
-            "score": np.inf,
-        }
-
-    if abs(z_end - z_start) < 1e-9:
-        z = np.array([z_start], dtype=np.float64)
-    else:
-        z = np.linspace(z_start, z_end, max(2, cfg.sample_count))
-
-    intercept_a, slope_a = _fit_linear_merge_proxy(graph, a)
-    intercept_b, slope_b = _fit_linear_merge_proxy(graph, b)
-
-    x_a = intercept_a + slope_a * z
-    x_b = intercept_b + slope_b * z
-    lateral = np.abs(x_a - x_b)
-
-    tangent_a = math.atan(slope_a)
-    tangent_b = math.atan(slope_b)
-    tangent_diff = abs(tangent_a - tangent_b)
-    tangent_diff = min(tangent_diff, math.pi - tangent_diff)
-
-    max_lateral = float(np.max(lateral))
-    median_lateral = float(np.median(lateral))
-    max_tangent_deg = float(math.degrees(tangent_diff))
-
-    compatible = (
-        max_lateral <= cfg.max_lateral_disagreement
-        and max_tangent_deg <= cfg.max_tangent_diff_deg
-    )
-
-    score = (
-        longitudinal_gap / max(cfg.max_longitudinal_gap, 1e-6)
-        + max_lateral / max(cfg.max_lateral_disagreement, 1e-6)
-        + max_tangent_deg / max(cfg.max_tangent_diff_deg, 1e-6)
-    )
-
-    return {
-        "compatible": bool(compatible),
-        "longitudinal_gap": longitudinal_gap,
-        "max_lateral_disagreement": max_lateral,
-        "median_lateral_disagreement": median_lateral,
-        "max_tangent_diff_deg": max_tangent_deg,
-        "score": float(score),
-    }
-
-def merge_compatible_lane_streams(
-    graph,
-    streams,
-    lane_fits=None,
-    merge_cfg=None,
-    fit_cfg=None,
-):
-    """
-    Merge fragmented fitted streams that appear to describe the same lane.
-
-    Merging is deliberately iterative. After each accepted merge the original
-    graph observations are combined and RANSAC is run again. This prevents us
-    from merely averaging two polynomial coefficient sets and forces the
-    merged lane model to be supported by the underlying vehicle observations.
-
-    Returns
-    -------
-    merged_streams : list[list[int]]
-        Node groups after consolidation.
-    merged_fits : list[dict]
-        Re-fitted lane models with distinct-track support metadata.
-    merge_events : list[dict]
-        Diagnostics for every accepted merge.
-    """
-    if merge_cfg is None:
-        merge_cfg = LaneMergeConfig()
-    if fit_cfg is None:
-        fit_cfg = LaneFitConfig()
-    if lane_fits is None:
-        lane_fits = fit_lane_streams(graph, streams, cfg=fit_cfg)
-
-    # Only streams with a valid fit can participate in geometric merging.
-    groups = []
-    for fit in lane_fits:
-        source_ids = list(fit.get("source_stream_ids", [fit["stream_id"]]))
-        nodes = sorted(
-            {
-                node
-                for source_id in source_ids
-                for node in streams[source_id]
-            }
-        )
-        current_fit = dict(fit)
-        current_fit["source_stream_ids"] = sorted(source_ids)
-        groups.append(
-            {
-                "nodes": nodes,
-                "fit": current_fit,
-                "source_stream_ids": sorted(source_ids),
-            }
-        )
-
-    merge_events = []
-
-    for _ in range(merge_cfg.max_iterations):
-        candidates = []
-        for i in range(len(groups)):
-            for j in range(i + 1, len(groups)):
-                metrics = _lane_fit_comparison(
-                    graph, groups[i]["fit"], groups[j]["fit"], merge_cfg
-                )
-                if metrics["compatible"]:
-                    candidates.append((metrics["score"], i, j, metrics))
-
-        if not candidates:
-            break
-
-        candidates.sort(key=lambda item: item[0])
-        merged_this_iteration = False
-
-        for _, i, j, metrics in candidates:
-            group_a = groups[i]
-            group_b = groups[j]
-            merged_nodes = sorted(set(group_a["nodes"]) | set(group_b["nodes"]))
-            merged_fit = fit_lane_stream(graph, merged_nodes, cfg=fit_cfg)
-            if merged_fit is None:
-                continue
-
-            # A merge is only useful if the refitted model actually retains
-            # evidence from both original groups rather than treating one
-            # whole fragment as RANSAC outliers.
-            inlier_set = set(merged_fit["inliers"])
-            if not (inlier_set & set(group_a["nodes"])):
-                continue
-            if not (inlier_set & set(group_b["nodes"])):
-                continue
-
-            source_ids = sorted(
-                set(group_a["source_stream_ids"])
-                | set(group_b["source_stream_ids"])
-            )
-            merged_fit["source_stream_ids"] = source_ids
-
-            merge_events.append(
-                {
-                    "source_stream_ids_a": list(group_a["source_stream_ids"]),
-                    "source_stream_ids_b": list(group_b["source_stream_ids"]),
-                    "merged_source_stream_ids": source_ids,
-                    **metrics,
-                    "refit_rmse": merged_fit["rmse"],
-                    "refit_inliers": len(merged_fit["inliers"]),
-                    "refit_num_tracks": merged_fit["num_tracks"],
-                }
-            )
-
-            new_group = {
-                "nodes": merged_nodes,
-                "fit": merged_fit,
-                "source_stream_ids": source_ids,
-            }
-
-            groups = [
-                group
-                for index, group in enumerate(groups)
-                if index not in (i, j)
-            ]
-            groups.append(new_group)
-            merged_this_iteration = True
-            break
-
-        if not merged_this_iteration:
-            break
-
-    # Give consolidated lanes fresh compact IDs. Sorting by the fitted lateral
-    # position at each fit's midpoint makes the numbering reasonably stable.
-    def lateral_key(group):
-        fit = group["fit"]
-        z_mid = 0.5 * (fit["z_min"] + fit["z_max"])
-        return float(evaluate_lane_polynomial(fit["coefficients"], z_mid))
-
-    groups.sort(key=lateral_key)
-
-    merged_streams = []
-    merged_fits = []
-    for stream_id, group in enumerate(groups):
-        fit = group["fit"]
-        fit["stream_id"] = stream_id
-        fit["source_stream_ids"] = list(group["source_stream_ids"])
-        merged_streams.append(sorted(group["nodes"]))
-        merged_fits.append(fit)
-
-    return merged_streams, merged_fits, merge_events
 
 def _average_polynomials(a, b):
     degree = max(len(a), len(b))
@@ -943,21 +626,7 @@ def infer_lane_boundaries(lane_fits, cfg=None):
                 overlap / max(2.0 * cfg.min_overlap, 1e-6),
             )
             width_score = float(np.exp(-width_std / 0.5))
-
-            # Two or more distinct tracked vehicles per centreline is stronger
-            # evidence than a trajectory formed from repeated observations of
-            # only one vehicle. If no track metadata exists, do not penalise.
-            if left.get("has_track_info") and right.get("has_track_info"):
-                track_score = min(
-                    1.0,
-                    min(left.get("num_tracks", 0), right.get("num_tracks", 0)) / 2.0,
-                )
-            else:
-                track_score = 1.0
-
-            confidence = float(
-                0.55 + 0.45 * overlap_score * width_score * track_score
-            )
+            confidence = float(0.6 + 0.4 * overlap_score * width_score)
 
             boundary = {
                 "left_stream_id": left["stream_id"],
@@ -1019,26 +688,14 @@ def infer_lane_boundaries(lane_fits, cfg=None):
             )
             continue
 
-        observation_score = min(1.0, inlier_count / 5.0)
+        support_score = min(1.0, inlier_count / 5.0)
         fit_score = float(
             np.exp(
                 -rmse / max(cfg.single_stream_max_rmse, 1e-6)
             )
         )
-
-        if fit.get("has_track_info"):
-            num_tracks = fit.get("num_tracks", 0)
-            # One tracked car remains useful trajectory evidence, but two or
-            # more independent cars provide full support.
-            track_score = min(1.0, num_tracks / 2.0)
-        else:
-            track_score = 1.0
-
         provisional_confidence = float(
-            cfg.single_stream_confidence
-            * observation_score
-            * fit_score
-            * track_score
+            cfg.single_stream_confidence * support_score * fit_score
         )
 
         left_boundary = {
@@ -1079,8 +736,6 @@ def infer_lane_boundaries(lane_fits, cfg=None):
 
         print(
             f"S{fit['stream_id']}: added provisional left/right boundaries | "
-            f"tracks={fit.get('num_tracks', 0)} | "
-            f"support={fit.get('track_support', 'unknown')} | "
             f"confidence={provisional_confidence:.2f}"
         )
 
@@ -1095,496 +750,6 @@ def infer_lane_boundaries(lane_fits, cfg=None):
 
     print(f"\nTotal inferred lane boundaries: {len(boundaries)}")
     return boundaries
-
-
-
-def transform_road_plane_to_camera(
-    road_plane,
-    source_cam_to_global,
-    target_cam_to_global,
-):
-    """Transform y = a*x + b*z + c from one camera frame to another."""
-    if road_plane is None:
-        return None
-
-    source_cam_to_global = np.asarray(source_cam_to_global, dtype=np.float64)
-    target_cam_to_global = np.asarray(target_cam_to_global, dtype=np.float64)
-    if source_cam_to_global.shape != (4, 4) or target_cam_to_global.shape != (4, 4):
-        raise ValueError("camera-to-global transforms must be 4x4")
-
-    a, b, c = np.asarray(road_plane["coefficients"], dtype=np.float64)
-
-    # Plane in homogeneous form:
-    #     a*x - y + b*z + c = 0
-    plane_source = np.array([a, -1.0, b, c], dtype=np.float64)
-
-    target_from_source = (
-        np.linalg.inv(target_cam_to_global) @ source_cam_to_global
-    )
-
-    # If x_target = T * x_source, then plane_target = T^-T plane_source.
-    plane_target = np.linalg.inv(target_from_source).T @ plane_source
-
-    y_coefficient = float(plane_target[1])
-    if abs(y_coefficient) < 1e-8:
-        return None
-
-    transformed_coefficients = np.array(
-        [
-            -plane_target[0] / y_coefficient,
-            -plane_target[2] / y_coefficient,
-            -plane_target[3] / y_coefficient,
-        ],
-        dtype=np.float64,
-    )
-
-    return {
-        "coefficients": transformed_coefficients,
-        "rmse": float(road_plane.get("rmse", 0.0)),
-        "inlier_count": int(road_plane.get("inlier_count", 0)),
-        "total_count": int(road_plane.get("total_count", 0)),
-        "model": "transformed_" + str(road_plane.get("model", "plane")),
-    }
-
-
-def transform_lane_boundary_to_camera(
-    boundary,
-    source_road_plane,
-    source_cam_to_global,
-    target_cam_to_global,
-    cfg=None,
-):
-    """
-    Ego-motion compensate a lane boundary into a new camera frame.
-
-    The boundary is sampled as 3D road points in the source camera, rigidly
-    transformed through global coordinates, then re-fitted as x(z) in the
-    target camera. This avoids directly transforming polynomial coefficients.
-    """
-    if cfg is None:
-        cfg = BoundaryTrackingConfig()
-    if source_road_plane is None:
-        return None
-
-    z = np.linspace(
-        float(boundary["z_min"]),
-        float(boundary["z_max"]),
-        max(cfg.sample_count, cfg.min_points_after_transform),
-    )
-    x = evaluate_lane_polynomial(boundary["coefficients"], z)
-    y = road_plane_y(source_road_plane, x, z)
-
-    source_points = np.column_stack(
-        [x, y, z, np.ones_like(z, dtype=np.float64)]
-    )
-
-    source_cam_to_global = np.asarray(source_cam_to_global, dtype=np.float64)
-    target_cam_to_global = np.asarray(target_cam_to_global, dtype=np.float64)
-    target_from_source = (
-        np.linalg.inv(target_cam_to_global) @ source_cam_to_global
-    )
-    target_points = source_points @ target_from_source.T
-
-    target_x = target_points[:, 0]
-    target_z = target_points[:, 2]
-    valid = (
-        np.isfinite(target_x)
-        & np.isfinite(target_z)
-        & (target_z >= cfg.min_depth)
-    )
-    target_x = target_x[valid]
-    target_z = target_z[valid]
-
-    if len(target_z) < cfg.min_points_after_transform:
-        return None
-
-    order = np.argsort(target_z)
-    target_z = target_z[order]
-    target_x = target_x[order]
-
-    degree = min(
-        max(1, len(np.asarray(boundary["coefficients"])) - 1),
-        len(target_z) - 1,
-    )
-    if np.unique(target_z).size <= degree:
-        return None
-
-    try:
-        fit_desc = np.polyfit(target_z, target_x, degree)
-    except (np.linalg.LinAlgError, ValueError):
-        return None
-
-    transformed = dict(boundary)
-    transformed.update(
-        {
-            "coefficients": fit_desc[::-1].copy(),
-            "z_min": float(target_z.min()),
-            "z_max": float(target_z.max()),
-            "overlap": float(target_z.max() - target_z.min()),
-            "ego_motion_compensated": True,
-        }
-    )
-    return transformed
-
-
-def _boundary_temporal_metrics(previous_boundary, current_boundary, cfg):
-    z_min = max(previous_boundary["z_min"], current_boundary["z_min"])
-    z_max = min(previous_boundary["z_max"], current_boundary["z_max"])
-    overlap = float(z_max - z_min)
-
-    if overlap < cfg.min_overlap:
-        return {
-            "compatible": False,
-            "overlap": overlap,
-            "median_lateral_distance": np.inf,
-            "max_tangent_diff_deg": np.inf,
-            "cost": np.inf,
-        }
-
-    z = np.linspace(z_min, z_max, max(3, cfg.sample_count))
-    x_previous = evaluate_lane_polynomial(previous_boundary["coefficients"], z)
-    x_current = evaluate_lane_polynomial(current_boundary["coefficients"], z)
-    lateral = np.abs(x_previous - x_current)
-
-    previous_slope = lane_polynomial_slope(previous_boundary["coefficients"], z)
-    current_slope = lane_polynomial_slope(current_boundary["coefficients"], z)
-    previous_angle = np.arctan(previous_slope)
-    current_angle = np.arctan(current_slope)
-    tangent_diff = np.abs(previous_angle - current_angle)
-    tangent_diff = np.minimum(tangent_diff, np.pi - tangent_diff)
-
-    median_lateral = float(np.median(lateral))
-    max_tangent_deg = float(np.degrees(np.max(tangent_diff)))
-
-    compatible = (
-        median_lateral <= cfg.max_lateral_distance
-        and max_tangent_deg <= cfg.max_tangent_diff_deg
-    )
-
-    previous_extent = max(
-        1e-6,
-        float(previous_boundary["z_max"] - previous_boundary["z_min"]),
-    )
-    current_extent = max(
-        1e-6,
-        float(current_boundary["z_max"] - current_boundary["z_min"]),
-    )
-    overlap_fraction = min(1.0, overlap / min(previous_extent, current_extent))
-
-    cost = (
-        median_lateral / max(cfg.max_lateral_distance, 1e-6)
-        + max_tangent_deg / max(cfg.max_tangent_diff_deg, 1e-6)
-        + 0.25 * (1.0 - overlap_fraction)
-    )
-
-    return {
-        "compatible": bool(compatible),
-        "overlap": overlap,
-        "median_lateral_distance": median_lateral,
-        "max_tangent_diff_deg": max_tangent_deg,
-        "cost": float(cost),
-    }
-
-
-def _smooth_boundary_geometry(previous_boundary, current_boundary, cfg):
-    """Smooth sampled x(z) geometry, then refit the current polynomial model."""
-    z = np.linspace(
-        current_boundary["z_min"],
-        current_boundary["z_max"],
-        max(6, cfg.sample_count),
-    )
-    x_current = evaluate_lane_polynomial(current_boundary["coefficients"], z)
-    x_smoothed = x_current.copy()
-
-    overlap_mask = (
-        (z >= previous_boundary["z_min"])
-        & (z <= previous_boundary["z_max"])
-    )
-
-    if np.any(overlap_mask):
-        x_previous = evaluate_lane_polynomial(
-            previous_boundary["coefficients"], z[overlap_mask]
-        )
-        alpha = float(np.clip(cfg.smoothing_alpha, 0.0, 1.0))
-        x_smoothed[overlap_mask] = (
-            alpha * x_current[overlap_mask]
-            + (1.0 - alpha) * x_previous
-        )
-
-    degree = min(
-        max(1, len(np.asarray(current_boundary["coefficients"])) - 1),
-        len(z) - 1,
-    )
-    try:
-        fit_desc = np.polyfit(z, x_smoothed, degree)
-    except (np.linalg.LinAlgError, ValueError):
-        return dict(current_boundary)
-
-    result = dict(current_boundary)
-    result["coefficients"] = fit_desc[::-1].copy()
-
-    alpha = float(np.clip(cfg.smoothing_alpha, 0.0, 1.0))
-    previous_confidence = float(previous_boundary.get("confidence", 1.0))
-    current_confidence = float(current_boundary.get("confidence", 1.0))
-    result["confidence"] = float(
-        alpha * current_confidence + (1.0 - alpha) * previous_confidence
-    )
-    result["smoothed"] = True
-    return result
-
-
-def update_temporal_lane_tracks(
-    state,
-    current_boundaries,
-    current_cam_to_global,
-    current_road_plane,
-    frame_index,
-    cfg=None,
-):
-    """
-    Associate, smooth and persist lane boundaries across scene frames.
-
-    Parameters
-    ----------
-    state : dict or None
-        Persistent tracker state returned by the previous call.
-    current_boundaries : list[dict]
-        Current-frame measurements from infer_lane_boundaries().
-    current_cam_to_global : ndarray (4, 4)
-        Pose of the current camera.
-    current_road_plane : dict or None
-        Current road plane estimate. If unavailable, transformed previous
-        planes are used for carried tracks when possible.
-    frame_index : int
-        Scene frame index.
-
-    Returns
-    -------
-    output_boundaries : list[dict]
-        Smoothed current measurements plus short-lived predicted boundaries.
-    state : dict
-        Updated persistent tracker state.
-    events : list[dict]
-        Association diagnostics for logging/evaluation.
-    """
-    if cfg is None:
-        cfg = BoundaryTrackingConfig()
-    if state is None:
-        state = {"tracks": {}, "next_track_id": 0}
-
-    current_cam_to_global = np.asarray(current_cam_to_global, dtype=np.float64)
-    previous_tracks = dict(state.get("tracks", {}))
-    next_track_id = int(state.get("next_track_id", 0))
-
-    transformed_tracks = {}
-    for track_id, track in previous_tracks.items():
-        source_plane = track.get("road_plane")
-        if source_plane is None:
-            continue
-
-        transformed_boundary = transform_lane_boundary_to_camera(
-            track["boundary"],
-            source_plane,
-            track["cam_to_global"],
-            current_cam_to_global,
-            cfg=cfg,
-        )
-        if transformed_boundary is None:
-            continue
-
-        transformed_plane = transform_road_plane_to_camera(
-            source_plane,
-            track["cam_to_global"],
-            current_cam_to_global,
-        )
-        transformed_tracks[track_id] = {
-            "track": track,
-            "boundary": transformed_boundary,
-            "road_plane": transformed_plane,
-        }
-
-    candidates = []
-    for track_id, predicted in transformed_tracks.items():
-        for measurement_index, boundary in enumerate(current_boundaries):
-            metrics = _boundary_temporal_metrics(
-                predicted["boundary"], boundary, cfg
-            )
-            if metrics["compatible"]:
-                candidates.append(
-                    (metrics["cost"], track_id, measurement_index, metrics)
-                )
-
-    candidates.sort(key=lambda item: item[0])
-    matched_tracks = set()
-    matched_measurements = set()
-    accepted_matches = []
-
-    for _, track_id, measurement_index, metrics in candidates:
-        if track_id in matched_tracks or measurement_index in matched_measurements:
-            continue
-        matched_tracks.add(track_id)
-        matched_measurements.add(measurement_index)
-        accepted_matches.append((track_id, measurement_index, metrics))
-
-    output_boundaries = []
-    new_tracks = {}
-    events = []
-
-    # Matched measurements: ego compensate previous geometry, smooth in x(z),
-    # and preserve the same persistent boundary ID.
-    for track_id, measurement_index, metrics in accepted_matches:
-        previous_record = transformed_tracks[track_id]
-        old_track = previous_record["track"]
-        current = current_boundaries[measurement_index]
-        fused = _smooth_boundary_geometry(
-            previous_record["boundary"], current, cfg
-        )
-
-        age = int(old_track.get("age", 1)) + 1
-        hits = int(old_track.get("hits", 1)) + 1
-        fused.update(
-            {
-                "boundary_track_id": int(track_id),
-                "temporal_status": "matched",
-                "track_age": age,
-                "track_hits": hits,
-                "missed_frames": 0,
-                "is_predicted": False,
-            }
-        )
-
-        track_plane = (
-            current_road_plane
-            if current_road_plane is not None
-            else previous_record["road_plane"]
-        )
-        new_tracks[track_id] = {
-            "track_id": int(track_id),
-            "boundary": dict(fused),
-            "cam_to_global": current_cam_to_global.copy(),
-            "road_plane": track_plane,
-            "last_frame_index": int(frame_index),
-            "age": age,
-            "hits": hits,
-            "missed_frames": 0,
-        }
-        output_boundaries.append(fused)
-        events.append(
-            {
-                "type": "matched",
-                "boundary_track_id": int(track_id),
-                "measurement_index": int(measurement_index),
-                **metrics,
-            }
-        )
-
-    # New measurements start new persistent lane-boundary tracks.
-    for measurement_index, boundary in enumerate(current_boundaries):
-        if measurement_index in matched_measurements:
-            continue
-
-        track_id = next_track_id
-        next_track_id += 1
-        new_boundary = dict(boundary)
-        new_boundary.update(
-            {
-                "boundary_track_id": int(track_id),
-                "temporal_status": "new",
-                "track_age": 1,
-                "track_hits": 1,
-                "missed_frames": 0,
-                "is_predicted": False,
-                "smoothed": False,
-            }
-        )
-        new_tracks[track_id] = {
-            "track_id": int(track_id),
-            "boundary": dict(new_boundary),
-            "cam_to_global": current_cam_to_global.copy(),
-            "road_plane": current_road_plane,
-            "last_frame_index": int(frame_index),
-            "age": 1,
-            "hits": 1,
-            "missed_frames": 0,
-        }
-        output_boundaries.append(new_boundary)
-        events.append(
-            {
-                "type": "new",
-                "boundary_track_id": int(track_id),
-                "measurement_index": int(measurement_index),
-            }
-        )
-
-    # Unmatched prior tracks are carried for a short period with decaying
-    # confidence. This bridges occasional missed FCOS3D / lane-fit frames.
-    for track_id, previous_record in transformed_tracks.items():
-        if track_id in matched_tracks:
-            continue
-
-        old_track = previous_record["track"]
-        missed_frames = int(old_track.get("missed_frames", 0)) + 1
-        if missed_frames > cfg.max_missed_frames:
-            events.append(
-                {
-                    "type": "expired",
-                    "boundary_track_id": int(track_id),
-                    "missed_frames": missed_frames,
-                }
-            )
-            continue
-
-        carried = dict(previous_record["boundary"])
-        carried["confidence"] = float(
-            carried.get("confidence", 1.0)
-            * cfg.missing_confidence_decay
-        )
-        age = int(old_track.get("age", 1)) + 1
-        hits = int(old_track.get("hits", 1))
-        carried.update(
-            {
-                "boundary_track_id": int(track_id),
-                "temporal_status": "predicted",
-                "track_age": age,
-                "track_hits": hits,
-                "missed_frames": missed_frames,
-                "is_predicted": True,
-                "smoothed": bool(carried.get("smoothed", False)),
-            }
-        )
-
-        carried_plane = previous_record["road_plane"]
-        new_tracks[track_id] = {
-            "track_id": int(track_id),
-            "boundary": dict(carried),
-            "cam_to_global": current_cam_to_global.copy(),
-            "road_plane": carried_plane,
-            "last_frame_index": int(frame_index),
-            "age": age,
-            "hits": hits,
-            "missed_frames": missed_frames,
-        }
-        output_boundaries.append(carried)
-        events.append(
-            {
-                "type": "predicted",
-                "boundary_track_id": int(track_id),
-                "missed_frames": missed_frames,
-            }
-        )
-
-    def lateral_key(boundary):
-        z_mid = 0.5 * (boundary["z_min"] + boundary["z_max"])
-        return float(
-            evaluate_lane_polynomial(boundary["coefficients"], z_mid)
-        )
-
-    output_boundaries.sort(key=lateral_key)
-    state = {
-        "tracks": new_tracks,
-        "next_track_id": next_track_id,
-    }
-    return output_boundaries, state, events
 
 
 def estimate_road_plane(pred_instances_3d, vehicles, cfg=None):
@@ -1740,13 +905,6 @@ def project_lane_boundaries_to_image(
                 "confidence": boundary.get("confidence", 1.0),
                 "side": boundary.get("side", "between"),
                 "source_stream_id": boundary.get("source_stream_id"),
-                "boundary_track_id": boundary.get("boundary_track_id"),
-                "temporal_status": boundary.get("temporal_status", "measurement"),
-                "track_age": boundary.get("track_age"),
-                "track_hits": boundary.get("track_hits"),
-                "missed_frames": boundary.get("missed_frames", 0),
-                "is_predicted": boundary.get("is_predicted", False),
-                "smoothed": boundary.get("smoothed", False),
             }
         )
 
@@ -1754,55 +912,33 @@ def project_lane_boundaries_to_image(
 
 
 def plot_projected_lane_boundaries(
-    image_path, projected_boundaries, save_path=None, show=True, title=None
+    image_path, projected_boundaries, save_path=None, show=True
 ):
     image = plt.imread(image_path)
     fig, ax = plt.subplots(figsize=(14, 8))
     ax.imshow(image)
-
     for boundary in projected_boundaries:
         pixels = boundary["pixels"]
-        if len(pixels) < 2:
-            continue
-
-        is_provisional = boundary.get("source") == "single_stream"
-        is_predicted = bool(boundary.get("is_predicted", False))
-        track_id = boundary.get("boundary_track_id")
-        status = boundary.get("temporal_status", "measurement")
-
-        if is_predicted:
-            linestyle = "--"
-            linewidth = 2
-        elif is_provisional:
-            linestyle = ":"
-            linewidth = 5
-        else:
-            linestyle = "-"
-            linewidth = 7
-
-        if track_id is not None:
-            label = f"B{track_id} {status}"
-        elif is_provisional:
+        if len(pixels) >= 2:
+            is_provisional = boundary.get("source") == "single_stream"
             label = (
                 f"provisional S{boundary.get('source_stream_id')} "
                 f"{boundary.get('side', '')}"
+                if is_provisional
+                else (
+                    f"boundary S{boundary['left_stream_id']}|"
+                    f"S{boundary['right_stream_id']}"
+                )
             )
-        else:
-            label = (
-                f"boundary S{boundary['left_stream_id']}|"
-                f"S{boundary['right_stream_id']}"
+            ax.plot(
+                pixels[:, 0],
+                pixels[:, 1],
+                linestyle=":" if is_provisional else "-",
+                linewidth=5 if is_provisional else 7,
+                alpha=max(0.25, boundary.get("confidence", 1.0)),
+                label=label,
             )
-
-        ax.plot(
-            pixels[:, 0],
-            pixels[:, 1],
-            linestyle=linestyle,
-            linewidth=linewidth,
-            alpha=max(0.20, float(boundary.get("confidence", 1.0))),
-            label=label,
-        )
-
-    ax.set_title(title or "Projected temporally tracked lane boundaries")
+    ax.set_title("Projected inferred lane boundaries")
     ax.axis("off")
     if projected_boundaries:
         ax.legend(loc="best")
@@ -1814,6 +950,7 @@ def plot_projected_lane_boundaries(
         plt.show()
     else:
         plt.close(fig)
+
 
 def _vehicle_rectangle(x, z, yaw, length, width):
     heading = heading_from_yaw(yaw)
@@ -1892,25 +1029,11 @@ def plot_lane_graph(
         for fit in lane_fits:
             z_curve = np.linspace(fit["z_min"], fit["z_max"], 100)
             x_curve = evaluate_lane_polynomial(fit["coefficients"], z_curve)
-            source_ids = fit.get("source_stream_ids", [fit["stream_id"]])
-            track_text = (
-                f" T={fit.get('num_tracks', 0)}"
-                if fit.get("has_track_info")
-                else ""
-            )
-            source_text = (
-                f" src={source_ids}"
-                if len(source_ids) > 1
-                else ""
-            )
             ax.plot(
                 x_curve,
                 z_curve,
                 linewidth=3,
-                label=(
-                    f"centre S{fit['stream_id']}"
-                    f"{track_text}{source_text}"
-                ),
+                label=f"centre S{fit['stream_id']}",
             )
 
     if lane_boundaries:
@@ -1918,40 +1041,21 @@ def plot_lane_graph(
             z_curve = np.linspace(boundary["z_min"], boundary["z_max"], 100)
             x_curve = evaluate_lane_polynomial(boundary["coefficients"], z_curve)
             is_provisional = boundary.get("source") == "single_stream"
-            is_predicted = bool(boundary.get("is_predicted", False))
-            track_id = boundary.get("boundary_track_id")
-            status = boundary.get("temporal_status", "measurement")
-
-            if is_predicted:
-                linestyle = "--"
-                linewidth = 2
-            elif is_provisional:
-                linestyle = ":"
-                linewidth = 5
-            else:
-                linestyle = "--"
-                linewidth = 7
-                
-
-            if track_id is not None:
-                label = f"B{track_id} {status}"
-            elif is_provisional:
-                label = (
-                    f"provisional S{boundary.get('source_stream_id')} "
-                    f"{boundary.get('side', '')}"
-                )
-            else:
-                label = (
+            label = (
+                f"provisional S{boundary.get('source_stream_id')} "
+                f"{boundary.get('side', '')}"
+                if is_provisional
+                else (
                     f"boundary S{boundary['left_stream_id']}|"
                     f"S{boundary['right_stream_id']}"
                 )
-
+            )
             ax.plot(
                 x_curve,
                 z_curve,
-                linestyle=linestyle,
-                linewidth=linewidth,
-                alpha=max(0.20, float(boundary.get("confidence", 1.0))),
+                linestyle=":" if is_provisional else "--",
+                linewidth=2 if is_provisional else 3,
+                alpha=max(0.25, boundary.get("confidence", 1.0)),
                 label=label,
             )
 
