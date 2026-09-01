@@ -68,8 +68,8 @@ WANTED_VEHICLE_CLASSES = {"car", "truck", "bus"}
 # SCENE REPLAY SETTINGS
 # =============================================================================
 # The scene folder only needs samples/ plus the scene-specific info pickle.
-SCENE_ROOT = Path("/mnt/z/dataset/scene-0064")
-SCENE_INFO_FILE = SCENE_ROOT / "nuscenes_infos_scene-0064.pkl"
+SCENE_ROOT = Path("/mnt/z/dataset/scene-0095")
+SCENE_INFO_FILE = SCENE_ROOT / "nuscenes_infos_scene-0095.pkl"
 
 # Playback modes:
 #   "realtime"  -> preserve timing from scene timestamps
