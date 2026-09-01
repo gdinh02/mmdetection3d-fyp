@@ -18,6 +18,7 @@ from lane_graph import (
     LaneBoundaryConfig,
     LaneFitConfig,
     LaneGraphConfig,
+    LeadVehicleConfig,
     LaneMergeConfig,
     LaneProjectionConfig,
     RoadPlaneConfig,
@@ -25,6 +26,7 @@ from lane_graph import (
     accumulate_temporal_vehicle_evidence,
     build_lane_compatibility_graph_from_vehicles,
     estimate_road_plane,
+    ensure_lead_vehicle_stream,
     extract_vehicles_from_prediction,
     fit_lane_streams,
     get_lane_streams,
@@ -34,10 +36,6 @@ from lane_graph import (
     update_temporal_lane_tracks,
 )
 
-'''
-To run
-python live_fcos3d_lane_graph.py --max-single-streams 3
-'''
 
 # =============================================================================
 # INPUT MODE
@@ -135,6 +133,8 @@ TEMP_JPEG_QUALITY = 95
 # =============================================================================
 GRAPH_CONFIG = LaneGraphConfig(
     score_thresh=0.30,
+    lead_score_thresh=0.15,
+    lead_candidate_max_abs_x=3.0,
     max_depth=50.0,
     max_cross_track=1.0,
     max_yaw_diff_deg=10.0,
@@ -150,6 +150,17 @@ TEMPORAL_CONFIG = TemporalConfig(
     max_track_frame_gap=1,
     temporal_decay=0.85,
     min_track_observations=2,
+    keep_latest_frame_detections=True,
+)
+
+LEAD_VEHICLE_CONFIG = LeadVehicleConfig(
+    enabled=True,
+    max_abs_x=3.0,
+    max_depth=45.0,
+    max_forward_yaw_diff_deg=45.0,
+    near_depth=3.0,
+    forward_extension=8.0,
+    max_abs_slope=0.75,
 )
 
 FIT_CONFIG = LaneFitConfig(
@@ -173,7 +184,7 @@ BOUNDARY_CONFIG = LaneBoundaryConfig(
     max_lane_width=5.0,
     sample_count=30,
     enable_single_stream_boundaries=True,
-    single_stream_only_when_no_paired=True,
+    single_stream_only_when_no_paired=False,
     default_lane_width=3.5,
     single_stream_min_inliers=3,
     single_stream_max_rmse=0.50,
@@ -618,6 +629,13 @@ def build_lane_result(history_records):
         merge_cfg=MERGE_CONFIG,
         fit_cfg=FIT_CONFIG,
     )
+    streams, lane_fits, lead_diagnostic = ensure_lead_vehicle_stream(
+        graph,
+        streams,
+        lane_fits,
+        current_frame_index=history_records[-1]["frame_index"],
+        cfg=LEAD_VEHICLE_CONFIG,
+    )
     boundaries = infer_lane_boundaries(lane_fits, cfg=BOUNDARY_CONFIG)
 
     return (
@@ -628,6 +646,7 @@ def build_lane_result(history_records):
         lane_fits,
         boundaries,
         merge_events,
+        lead_diagnostic,
     )
 
 
@@ -641,7 +660,13 @@ def draw_projected_boundaries(frame_bgr, projected_boundaries):
 
         points = np.rint(pixels).astype(np.int32).reshape(-1, 1, 2)
         is_predicted = bool(boundary.get("is_predicted", False))
-        color = (0, 165, 255) if is_predicted else (255, 180, 0)
+        is_lead = bool(boundary.get("forced_lead", False))
+        if is_predicted:
+            color = (0, 165, 255)
+        elif is_lead:
+            color = (0, 255, 255)
+        else:
+            color = (255, 180, 0)
         cv2.polylines(
             output,
             [points],
@@ -655,9 +680,9 @@ def draw_projected_boundaries(frame_bgr, projected_boundaries):
         track_id = boundary.get("boundary_track_id")
         status = boundary.get("temporal_status", "measurement")
         label = (
-            f"lane B{track_id} {status}"
+            f"{'lead ' if is_lead else ''}lane B{track_id} {status}"
             if track_id is not None
-            else f"lane {boundary_index}"
+            else f"{'lead ' if is_lead else ''}lane {boundary_index}"
         )
         cv2.putText(
             output,
@@ -681,6 +706,7 @@ def draw_status(
     vehicle_count,
     boundary_count,
     history_size,
+    lead_diagnostic,
 ):
     lines = [
         f"input: {INPUT_MODE} | {packet.source_name}",
@@ -689,6 +715,14 @@ def draw_status(
         f"vehicles: {vehicle_count}",
         f"boundaries: {boundary_count}",
         f"history: {history_size}",
+        (
+            "lead: "
+            f"{lead_diagnostic.get('status', 'unknown')} "
+            f"T{lead_diagnostic.get('track_id', '-')} "
+            f"S{lead_diagnostic.get('stream_id', '-')} "
+            f"x={lead_diagnostic.get('x', float('nan')):.1f} "
+            f"z={lead_diagnostic.get('z', float('nan')):.1f}"
+        ),
     ]
     if INPUT_MODE == "scene_replay":
         lines.append(f"replay: {REPLAY_MODE} | speed={REPLAY_SPEED:g}x")
@@ -887,6 +921,7 @@ def main(argv=None):
                     lane_fits,
                     lane_boundaries,
                     merge_events,
+                    lead_diagnostic,
                 ) = build_lane_result(history)
 
                 boundary_events = []
@@ -933,6 +968,7 @@ def main(argv=None):
                     len(current_vehicles),
                     len(projected_boundaries),
                     len(history),
+                    lead_diagnostic,
                 )
 
                 if SAVE_OUTPUT_VIDEO:
@@ -962,6 +998,18 @@ def main(argv=None):
                     f"merges={len(merge_events)} | "
                     f"boundaries={len(projected_boundaries)} | "
                     f"boundary_events={len(boundary_events)} | "
+                    f"lead={lead_diagnostic.get('status')} "
+                    f"T{lead_diagnostic.get('track_id')} "
+                    f"S{lead_diagnostic.get('stream_id')} "
+                    f"graph_degree={lead_diagnostic.get('graph_degree')} "
+                    f"component={lead_diagnostic.get('component_size')} "
+                    f"x={lead_diagnostic.get('x', float('nan')):.2f} "
+                    f"z={lead_diagnostic.get('z', float('nan')):.2f} "
+                    f"yaw={lead_diagnostic.get('yaw_deg', float('nan')):.1f}deg "
+                    f"score={lead_diagnostic.get('score', float('nan')):.2f} "
+                    f"track_obs={lead_diagnostic.get('track_observations', 0)} "
+                    f"confirmed={lead_diagnostic.get('track_confirmed', False)} "
+                    f"low_score={lead_diagnostic.get('below_standard_score', False)} | "
                     f"FCOS3D={inference_ms:.1f} ms"
                 )
 

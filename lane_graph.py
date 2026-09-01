@@ -10,6 +10,10 @@ from matplotlib.patches import Polygon
 @dataclass
 class LaneGraphConfig:
     score_thresh: float = 0.25
+    # A centred lead vehicle is valuable lane evidence even when FCOS3D gives
+    # it a slightly lower score than the general graph threshold.
+    lead_score_thresh: float = 0.15
+    lead_candidate_max_abs_x: float = 3.0
     max_depth: float = 60.0
     max_cross_track: float = 1.6
     max_yaw_diff_deg: float = 15.0
@@ -26,6 +30,20 @@ class TemporalConfig:
     max_track_frame_gap: int = 1
     temporal_decay: float = 0.90
     min_track_observations: int = 1
+    # Never discard detections from the reference/latest frame merely because
+    # their temporal track has not accumulated enough observations yet.
+    keep_latest_frame_detections: bool = True
+
+
+@dataclass
+class LeadVehicleConfig:
+    enabled: bool = True
+    max_abs_x: float = 3.0
+    max_depth: float = 45.0
+    max_forward_yaw_diff_deg: float = 45.0
+    near_depth: float = 3.0
+    forward_extension: float = 8.0
+    max_abs_slope: float = 0.75
 
 
 @dataclass
@@ -178,12 +196,20 @@ def extract_vehicles_from_prediction(pred_instances_3d, vehicle_label_ids, cfg=N
     for original_idx in range(len(boxes)):
         score = float(scores[original_idx])
         label = int(labels[original_idx])
-        if score < cfg.score_thresh or label not in vehicle_label_ids:
+        if label not in vehicle_label_ids:
             continue
 
         x = float(bev[original_idx, 0])
         z = float(bev[original_idx, 1])
         if z <= 0 or z > cfg.max_depth:
+            continue
+
+        passes_standard_score = score >= cfg.score_thresh
+        passes_lead_score = (
+            score >= cfg.lead_score_thresh
+            and abs(x) <= cfg.lead_candidate_max_abs_x
+        )
+        if not (passes_standard_score or passes_lead_score):
             continue
 
         vehicles.append(
@@ -198,6 +224,7 @@ def extract_vehicles_from_prediction(pred_instances_3d, vehicle_label_ids, cfg=N
                 "score": score,
                 "evidence_weight": 1.0,
                 "label": label,
+                "below_standard_score": not passes_standard_score,
             }
         )
 
@@ -377,6 +404,13 @@ def assign_temporal_tracks(frame_vehicles, cfg=None):
                 }
             all_detections.append(detection)
 
+    for detection in all_detections:
+        observations = tracks[detection["track_id"]]["observations"]
+        detection["track_observations"] = int(observations)
+        detection["track_confirmed"] = bool(
+            observations >= cfg.min_track_observations
+        )
+
     if cfg.min_track_observations <= 1:
         return all_detections, tracks
 
@@ -385,7 +419,16 @@ def assign_temporal_tracks(frame_vehicles, cfg=None):
         for track_id, track in tracks.items()
         if track["observations"] >= cfg.min_track_observations
     }
-    return [d for d in all_detections if d["track_id"] in keep], tracks
+    latest_frame_index = frame_vehicles[-1][0] if frame_vehicles else None
+    return [
+        detection
+        for detection in all_detections
+        if detection["track_id"] in keep
+        or (
+            cfg.keep_latest_frame_detections
+            and detection.get("frame_index") == latest_frame_index
+        )
+    ], tracks
 
 
 def accumulate_temporal_vehicle_evidence(
@@ -559,6 +602,181 @@ def fit_lane_streams(graph, streams, cfg=None):
             fit["source_stream_ids"] = [stream_id]
             fits.append(fit)
     return fits
+
+
+def ensure_lead_vehicle_stream(
+    graph,
+    streams,
+    lane_fits,
+    current_frame_index,
+    cfg=None,
+):
+    """Guarantee that the current front-centre vehicle supports a lane fit.
+
+    Ordinary stream fitting needs at least two observations at distinct
+    forward depths. A stopped vehicle can produce several ego-compensated
+    observations at essentially one point, so it may have a valid track but no
+    fit. In that case its FCOS3D yaw supplies the tangent of a conservative
+    one-vehicle anchor line.
+
+    The guarantee starts after detection: if FCOS3D produces no eligible
+    current-frame vehicle, this function reports that fact and cannot invent
+    one.
+    """
+    if cfg is None:
+        cfg = LeadVehicleConfig()
+
+    streams = [list(stream) for stream in streams]
+    lane_fits = [dict(fit) for fit in lane_fits]
+    diagnostic = {
+        "status": "disabled" if not cfg.enabled else "no_current_vehicle",
+        "selected_node": None,
+        "track_id": None,
+        "stream_id": None,
+        "graph_degree": 0,
+        "component_size": 0,
+        "used_anchor": False,
+    }
+    if not cfg.enabled:
+        return streams, lane_fits, diagnostic
+
+    current_nodes = [
+        node
+        for node, vehicle in graph.nodes(data=True)
+        if vehicle.get("frame_index") == current_frame_index
+        and 0.0 < float(vehicle["z"]) <= cfg.max_depth
+        and abs(float(vehicle["x"])) <= cfg.max_abs_x
+    ]
+    if not current_nodes:
+        return streams, lane_fits, diagnostic
+
+    forward_yaw = -0.5 * math.pi
+    max_yaw_diff = math.radians(cfg.max_forward_yaw_diff_deg)
+    aligned_nodes = [
+        node
+        for node in current_nodes
+        if axial_angle_diff(graph.nodes[node]["yaw"], forward_yaw)
+        <= max_yaw_diff
+    ]
+    candidates = aligned_nodes or current_nodes
+
+    # Angular proximity to the optical axis identifies "the car in front"
+    # more reliably than x alone at different depths. Prefer the nearer car
+    # when angular offsets are effectively tied.
+    lead_node = min(
+        candidates,
+        key=lambda node: (
+            abs(
+                math.atan2(
+                    float(graph.nodes[node]["x"]),
+                    float(graph.nodes[node]["z"]),
+                )
+            ),
+            float(graph.nodes[node]["z"]),
+        ),
+    )
+    lead = graph.nodes[lead_node]
+    diagnostic.update(
+        {
+            "selected_node": int(lead_node),
+            "track_id": lead.get("track_id"),
+            "x": float(lead["x"]),
+            "z": float(lead["z"]),
+            "yaw_deg": float(math.degrees(lead["yaw"])),
+            "score": float(lead["score"]),
+            "below_standard_score": bool(
+                lead.get("below_standard_score", False)
+            ),
+            "track_observations": int(lead.get("track_observations", 1)),
+            "track_confirmed": bool(lead.get("track_confirmed", True)),
+            "graph_degree": int(graph.degree[lead_node]),
+            "component_size": int(
+                len(nx.node_connected_component(graph, lead_node))
+            ),
+        }
+    )
+
+    for fit in lane_fits:
+        if lead_node not in fit.get("inliers", []):
+            continue
+        fit.update(
+            {
+                "is_lead_stream": True,
+                "forced_lead": False,
+                "lead_node_id": int(lead_node),
+                "lead_track_id": lead.get("track_id"),
+                "lead_score": float(lead["score"]),
+            }
+        )
+        diagnostic.update(
+            {
+                "status": "existing_fit",
+                "stream_id": int(fit["stream_id"]),
+            }
+        )
+        return streams, lane_fits, diagnostic
+
+    heading = heading_from_yaw(float(lead["yaw"]))
+    if abs(float(heading[1])) < 1e-6:
+        raw_slope = 0.0
+        slope_fallback = True
+    else:
+        raw_slope = float(heading[0] / heading[1])
+        slope_fallback = abs(raw_slope) > cfg.max_abs_slope
+
+    slope = (
+        0.0
+        if slope_fallback
+        else float(np.clip(raw_slope, -cfg.max_abs_slope, cfg.max_abs_slope))
+    )
+    intercept = float(lead["x"] - slope * lead["z"])
+    z_min = float(min(lead["z"], max(cfg.near_depth, 1.0)))
+    z_max = float(
+        min(cfg.max_depth, max(lead["z"] + cfg.forward_extension, z_min + 1.0))
+    )
+
+    stream_id = max(
+        [int(fit.get("stream_id", -1)) for fit in lane_fits],
+        default=-1,
+    ) + 1
+    track_id = lead.get("track_id")
+    anchor_fit = {
+        "stream_id": stream_id,
+        "source_stream_ids": [],
+        "degree": 1,
+        "coefficients": np.array([intercept, slope], dtype=np.float64),
+        "inliers": [int(lead_node)],
+        "outliers": [],
+        "rmse": 0.0,
+        "z_min": z_min,
+        "z_max": z_max,
+        "num_observations": 1,
+        "track_ids": [] if track_id is None else [int(track_id)],
+        "num_tracks": 0 if track_id is None else 1,
+        "has_track_info": track_id is not None,
+        "track_support": "lead_anchor",
+        "source": "lead_vehicle_anchor",
+        "is_lead_stream": True,
+        "forced_lead": True,
+        "lead_node_id": int(lead_node),
+        "lead_track_id": track_id,
+        "lead_score": float(lead["score"]),
+        "yaw_slope_fallback": bool(slope_fallback),
+    }
+    streams.append([int(lead_node)])
+    lane_fits.append(anchor_fit)
+    diagnostic.update(
+        {
+            "status": "anchored_fit",
+            "stream_id": int(stream_id),
+            "used_anchor": True,
+            "yaw_slope_fallback": bool(slope_fallback),
+            "anchor_slope": float(slope),
+            "z_min": z_min,
+            "z_max": z_max,
+        }
+    )
+    return streams, lane_fits, diagnostic
 
 
 def _fit_linear_merge_proxy(graph, fit):
@@ -986,6 +1204,9 @@ def infer_lane_boundaries(lane_fits, cfg=None):
                 "source": "paired_streams",
                 "confidence": confidence,
                 "side": "between",
+                "forced_lead": bool(
+                    left.get("is_lead_stream") or right.get("is_lead_stream")
+                ),
             }
 
             paired_boundaries.append(boundary)
@@ -1027,14 +1248,49 @@ def infer_lane_boundaries(lane_fits, cfg=None):
     # ---------------------------------------------------------
     # 3. Lower-confidence single-stream boundaries
     # ---------------------------------------------------------
+    eligible_fits = []
     for fit in lane_fits:
         inlier_count = len(fit.get("inliers", []))
         rmse = float(fit.get("rmse", np.inf))
+        span = float(fit["z_max"] - fit["z_min"])
+        forced_lead = bool(fit.get("forced_lead", False))
+        lead_stream = bool(fit.get("is_lead_stream", False))
+
+        # A forced lead anchor is the deliberate exception to the ordinary
+        # multi-observation quality gates. It is created from one current car
+        # plus its FCOS3D yaw precisely because no normal line fit was possible.
+        if lead_stream:
+            eligible_fits.append(fit)
+            continue
+
+        if cfg.single_stream_only_when_no_paired and paired_boundaries:
+            print(
+                f"S{fit['stream_id']}: single-stream fallback suppressed "
+                "because paired-stream boundaries exist"
+            )
+            continue
 
         if inlier_count < cfg.single_stream_min_inliers:
             print(
                 f"S{fit['stream_id']}: not enough inliers for "
                 f"single-stream boundaries ({inlier_count})"
+            )
+            continue
+
+        if span < cfg.single_stream_min_span:
+            print(
+                f"S{fit['stream_id']}: fitted span too short "
+                f"({span:.2f} m)"
+            )
+            continue
+
+        if (
+            fit.get("has_track_info")
+            and fit.get("num_tracks", 0) < cfg.single_stream_min_tracks
+        ):
+            print(
+                f"S{fit['stream_id']}: insufficient distinct tracks "
+                f"({fit.get('num_tracks', 0)})"
             )
             continue
 
@@ -1045,7 +1301,25 @@ def infer_lane_boundaries(lane_fits, cfg=None):
             )
             continue
 
-        observation_score = min(1.0, inlier_count / 5.0)
+        eligible_fits.append(fit)
+
+    forced_fits = [fit for fit in eligible_fits if fit.get("is_lead_stream")]
+    ordinary_fits = [fit for fit in eligible_fits if not fit.get("is_lead_stream")]
+    ordinary_fits.sort(
+        key=lambda fit: (
+            -len(fit.get("inliers", [])),
+            float(fit.get("rmse", np.inf)),
+        )
+    )
+    ordinary_fits = ordinary_fits[: max(0, cfg.max_single_stream_fits)]
+
+    for fit in forced_fits + ordinary_fits:
+        inlier_count = len(fit.get("inliers", []))
+        rmse = float(fit.get("rmse", 0.0))
+        forced_lead = bool(fit.get("forced_lead", False))
+        lead_stream = bool(fit.get("is_lead_stream", False))
+
+        observation_score = 1.0 if lead_stream else min(1.0, inlier_count / 5.0)
         fit_score = float(
             np.exp(
                 -rmse / max(cfg.single_stream_max_rmse, 1e-6)
@@ -1060,12 +1334,24 @@ def infer_lane_boundaries(lane_fits, cfg=None):
         else:
             track_score = 1.0
 
-        provisional_confidence = float(
-            cfg.single_stream_confidence
-            * observation_score
-            * fit_score
-            * track_score
-        )
+        if lead_stream:
+            provisional_confidence = float(
+                cfg.single_stream_confidence
+                * max(0.5, float(fit.get("lead_score", 1.0)))
+            )
+            boundary_source = (
+                "lead_vehicle_anchor"
+                if forced_lead
+                else "lead_vehicle_stream"
+            )
+        else:
+            provisional_confidence = float(
+                cfg.single_stream_confidence
+                * observation_score
+                * fit_score
+                * track_score
+            )
+            boundary_source = "single_stream"
 
         left_boundary = {
             "left_stream_id": None,
@@ -1078,10 +1364,11 @@ def infer_lane_boundaries(lane_fits, cfg=None):
             "overlap": float(fit["z_max"] - fit["z_min"]),
             "lane_width": estimated_lane_width,
             "lane_width_std": 0.0,
-            "source": "single_stream",
+            "source": boundary_source,
             "confidence": provisional_confidence,
             "side": "left",
             "source_stream_id": fit["stream_id"],
+            "forced_lead": lead_stream,
         }
         add_boundary(left_boundary)
 
@@ -1096,10 +1383,11 @@ def infer_lane_boundaries(lane_fits, cfg=None):
             "overlap": float(fit["z_max"] - fit["z_min"]),
             "lane_width": estimated_lane_width,
             "lane_width_std": 0.0,
-            "source": "single_stream",
+            "source": boundary_source,
             "confidence": provisional_confidence,
             "side": "right",
             "source_stream_id": fit["stream_id"],
+            "forced_lead": lead_stream,
         }
         add_boundary(right_boundary)
 
@@ -1497,7 +1785,8 @@ def update_temporal_lane_tracks(
             "missed_frames": 0,
         }
         confirmed = hits >= cfg.min_confirmed_hits
-        if confirmed or cfg.emit_unconfirmed:
+        force_emit = bool(fused.get("forced_lead", False))
+        if confirmed or cfg.emit_unconfirmed or force_emit:
             output_boundaries.append(fused)
         events.append(
             {
@@ -1538,7 +1827,8 @@ def update_temporal_lane_tracks(
             "missed_frames": 0,
         }
         confirmed = 1 >= cfg.min_confirmed_hits
-        if confirmed or cfg.emit_unconfirmed:
+        force_emit = bool(new_boundary.get("forced_lead", False))
+        if confirmed or cfg.emit_unconfirmed or force_emit:
             output_boundaries.append(new_boundary)
         events.append(
             {
@@ -1781,6 +2071,7 @@ def project_lane_boundaries_to_image(
                 "missed_frames": boundary.get("missed_frames", 0),
                 "is_predicted": boundary.get("is_predicted", False),
                 "smoothed": boundary.get("smoothed", False),
+                "forced_lead": bool(boundary.get("forced_lead", False)),
             }
         )
 
