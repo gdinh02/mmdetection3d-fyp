@@ -124,7 +124,7 @@ def get_camera_cam_to_global(frame_id, timestamp_s):
 DISPLAY_WINDOW = True
 WINDOW_NAME = "Live / replay FCOS3D lane inference"
 SAVE_OUTPUT_VIDEO = True
-OUTPUT_VIDEO_PATH = SCENE_ROOT/"live_lane_inference.mp4"
+OUTPUT_VIDEO_PATH = SCENE_ROOT/"live_lane_inference2.mp4"
 TEMP_JPEG_QUALITY = 95
 
 
@@ -136,16 +136,16 @@ GRAPH_CONFIG = LaneGraphConfig(
     lead_score_thresh=0.15,
     lead_candidate_max_abs_x=3.0,
     max_depth=50.0,
-    max_cross_track=1.0,
+    max_cross_track=1,
     max_yaw_diff_deg=10.0,
     max_along_track=25.0,
-    sigma_cross_track=0.8,
+    sigma_cross_track=0.7,
     sigma_yaw_deg=5.0,
 )
 
 TEMPORAL_CONFIG = TemporalConfig(
     history_frames=5,
-    max_track_distance=12.0,
+    max_track_distance=8.0,
     max_track_yaw_diff_deg=30.0,
     max_track_frame_gap=1,
     temporal_decay=0.85,
@@ -160,7 +160,7 @@ LEAD_VEHICLE_CONFIG = LeadVehicleConfig(
     max_forward_yaw_diff_deg=45.0,
     near_depth=3.0,
     forward_extension=8.0,
-    max_abs_slope=0.75,
+    max_abs_slope=0.85,
 )
 
 FIT_CONFIG = LaneFitConfig(
@@ -191,7 +191,7 @@ BOUNDARY_CONFIG = LaneBoundaryConfig(
     single_stream_confidence=0.45,
     single_stream_min_tracks=1,
     single_stream_min_span=3.0,
-    max_single_stream_fits=2,
+    max_single_stream_fits=3,
 )
 
 ROAD_PLANE_CONFIG = RoadPlaneConfig(
@@ -205,6 +205,8 @@ PROJECTION_CONFIG = LaneProjectionConfig(
     min_depth=1.0,
     clip_to_image=True,
 )
+
+ENABLE_BOUNDARY_TRACKING = True
 
 BOUNDARY_TRACKING_CONFIG = BoundaryTrackingConfig(
     min_overlap=1.5,
@@ -925,7 +927,7 @@ def main(argv=None):
                 ) = build_lane_result(history)
 
                 boundary_events = []
-                if boundary_tracking_enabled():
+                if boundary_tracking_enabled() and ENABLE_BOUNDARY_TRACKING:
                     (
                         lane_boundaries,
                         boundary_tracker_state,
