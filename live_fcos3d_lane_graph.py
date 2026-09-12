@@ -124,7 +124,7 @@ def get_camera_cam_to_global(frame_id, timestamp_s):
 DISPLAY_WINDOW = True
 WINDOW_NAME = "Live / replay FCOS3D lane inference"
 SAVE_OUTPUT_VIDEO = True
-OUTPUT_VIDEO_PATH = SCENE_ROOT/"live_lane_inference2.mp4"
+OUTPUT_VIDEO_PATH = SCENE_ROOT/"live_lane_inference3.mp4"
 TEMP_JPEG_QUALITY = 95
 
 
@@ -978,7 +978,7 @@ def main(argv=None):
                         height, width = output.shape[:2]
                         video_writer = cv2.VideoWriter(
                             str(OUTPUT_VIDEO_PATH),
-                            cv2.VideoWriter_fourcc(*"mp4v"),
+                            cv2.VideoWriter_fourcc(*"mp4v"), # type: ignore
                             max(1.0, pipeline_fps),
                             (width, height),
                         )
